@@ -55,6 +55,7 @@ footer { padding: 14px; text-align: center; }
 .center, .side { display: grid; gap: 10px; min-width: 0; }
 #markets { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .mkt { display: grid; grid-template-columns: 1fr auto; padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--line); gap: 0 8px; }
+.mkt-seg { display: flex; margin: 6px; } .mkt-seg button { flex: 1; }
 .mkt:last-child { border-bottom: none; } .mkt:hover, .mkt.on { background: var(--panel2); }
 .mkt b { font-size: 13px; } .mkt span { font-family: var(--mono); font-size: 12px; text-align: right; }
 .chart-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -95,6 +96,11 @@ td button { padding: 2px 8px; font-family: inherit; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 textarea { resize: vertical; }
 .est { margin-bottom: 4px; min-height: 1.3em; } #avail { margin-bottom: 8px; }
+.fut-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-bottom: 6px; }
+.fut-stats span { display: block; color: var(--muted); font-size: 11px; } .fut-stats b { font-family: var(--mono); font-size: 13px; }
+form.transfer { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; } form.transfer select { grid-column: 1 / -1; }
+form.transfer button:last-child { grid-column: 1 / -1; }
+td a { color: var(--text); }
 
 /* pages */
 .page { display: grid; gap: 10px; max-width: 1100px; margin: 0 auto; }
@@ -113,10 +119,11 @@ td input { padding: 3px 6px; width: 130px; }
   #view-trade { grid-template-columns: minmax(0, 1fr) 290px; }
   #markets { grid-column: 1 / -1; display: flex; overflow-x: auto; }
   .mkt { flex: none; border-bottom: none; border-right: 1px solid var(--line); min-width: 130px; }
+  .mkt-seg { flex: none; align-self: center; flex-direction: column; }
 }
 @media (max-width: 720px) {
   #view-trade { grid-template-columns: minmax(0, 1fr); }
-  .side { order: 2; } .center { order: 1; } .form-panel { order: -1; }
+  .side { order: 2; } .center { order: 1; } .form-panel { order: -1; } #fut-panel { order: -2; }
   #chart { height: 300px; }
   header .right { margin-left: 0; }
 }

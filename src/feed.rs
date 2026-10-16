@@ -46,6 +46,7 @@ pub fn handle_message(eng: &mut Engine, text: &str, now: i64, verify: bool) -> R
                 let (Some(pi), Some(qi)) = (g("price_increment"), g("qty_increment")) else { continue };
                 eng.set_instrument(Instrument {
                     symbol: symbol.to_string(),
+                    kind: "spot",
                     base: p["base"].as_str().unwrap_or("").to_string(),
                     quote: p["quote"].as_str().unwrap_or("").to_string(),
                     price_increment: pi,
@@ -231,6 +232,17 @@ fn sim_spec(base: &str) -> (u32, &'static str, &'static str) {
     }
 }
 
+/// Kraken's contract size step for each simulated perp.
+fn sim_perp_step(base: &str) -> &'static str {
+    match base {
+        "BTC" => "0.0001",
+        "ETH" => "0.001",
+        "SOL" | "LTC" => "0.01",
+        "LINK" => "0.1",
+        _ => "1",
+    }
+}
+
 struct SimBook {
     symbol: String,
     tick: Decimal,
@@ -248,23 +260,39 @@ pub async fn run_sim(engine: Shared, cfg: Arc<Config>) {
     {
         let mut e = engine.lock().unwrap();
         let now = now_ms();
-        for symbol in &cfg.symbols {
-            let (base, quote) = symbol.split_once('/').unwrap();
+        for symbol in cfg.markets() {
+            let perp = cfg.is_perp(symbol);
+            let (base, quote) = symbol.split_once('/').unwrap_or((symbol.trim_end_matches("-PERP"), &cfg.quote));
             let (prec, qty_min, start) = sim_spec(base);
             let tick = Decimal::new(1, prec);
             let start = d(start);
+            let step = if perp { d(sim_perp_step(base)) } else { d("0.00000001") };
             e.set_instrument(Instrument {
                 symbol: symbol.clone(),
+                kind: if perp { "perp" } else { "spot" },
                 base: base.into(),
                 quote: quote.into(),
                 price_increment: tick,
-                qty_increment: d("0.00000001"),
-                qty_min: d(qty_min),
-                cost_min: d("0.5"),
+                qty_increment: step,
+                qty_min: if perp { step } else { d(qty_min) },
+                cost_min: if perp { Decimal::ZERO } else { d("0.5") },
                 price_precision: prec,
-                qty_precision: 8,
+                qty_precision: step.normalize().scale(),
                 status: "online".into(),
             });
+            if perp {
+                // Kraken's first tiers: 100x for the majors, 50x for the rest
+                let first = if matches!(base, "BTC" | "ETH" | "SOL") { ("0.01", "0.005") } else { ("0.02", "0.01") };
+                e.set_perp_rules(
+                    symbol,
+                    vec![
+                        (Decimal::ZERO, d(first.0), d(first.1)),
+                        (d("1000000"), d("0.04"), d("0.02")),
+                        (d("5000000"), d("0.1"), d("0.05")),
+                    ],
+                    None,
+                );
+            }
             let mid: i64 = (start / tick).try_into().unwrap();
             // synthetic history
             for iv in INTERVALS {
@@ -296,14 +324,17 @@ pub async fn run_sim(engine: Shared, cfg: Arc<Config>) {
             });
         }
         e.feed_up(now);
+        e.fut_feed_up(now);
     }
     tracing::warn!("FEED=sim: prices are synthetic random walks, not real market data");
     let mut first = true;
+    let mut ticks = 0u64;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let now = now_ms();
         let mut e = engine.lock().unwrap();
         e.feed_up(now);
+        e.fut_feed_up(now);
         for b in books.iter_mut() {
             let to_dec = |t: i64| Decimal::from(t) * b.tick;
             b.mid += rng.gen_range(-3..=3) * b.step;
@@ -357,6 +388,26 @@ pub async fn run_sim(engine: Shared, cfg: Arc<Config>) {
                         e.on_trade(&b.symbol, price, take, if buy { Side::Buy } else { Side::Sell }, now, true, now);
                     }
                 }
+            }
+        }
+        // perp tickers once a second: mark = book mid, index = the spot mid, a small random funding rate
+        ticks += 1;
+        if ticks % 5 == 1 {
+            let period = cfg.sim_funding_secs.max(10) * 1000;
+            for b in books.iter().filter(|b| cfg.is_perp(&b.symbol)) {
+                let mid = Decimal::from(b.mid) * b.tick;
+                let spot = format!("{}/{}", b.symbol.trim_end_matches("-PERP"), cfg.quote);
+                let index = books.iter().find(|x| x.symbol == spot).map(|x| Decimal::from(x.mid) * x.tick);
+                let rate = Decimal::try_from(rng.gen_range(-0.00002..0.00005)).unwrap().round_dp(8);
+                e.on_perp_ticker(
+                    &b.symbol,
+                    Some(mid),
+                    index.or(Some(mid)),
+                    Some(rate),
+                    Some((now / period + 1) * period),
+                    None,
+                    Ticker::default(),
+                );
             }
         }
         first = false;

@@ -347,9 +347,9 @@ class Run:
             for x in t["tickers"]:
                 expect(x["bid"] and x["ask"] and x["last"], f"{x['symbol']} 缺少报价")
                 expect(D(x["bid"]) < D(x["ask"]), f"{x['symbol']} 买一 {x['bid']} 不低于卖一 {x['ask']}")
-            return f"{len(t['tickers'])} 个交易对"
+            return f"{len(t['tickers'])} 个市场"
 
-        if not self.check("行情在线，所有交易对可交易、买一 < 卖一", tickers):
+        if not self.check("行情在线，所有市场可交易、买一 < 卖一", tickers):
             return False
 
         def instruments():
@@ -593,6 +593,135 @@ class Run:
 
         self.check("市价卖出：持仓卖回", market_sell)
 
+    # ---- perpetual futures
+
+    def futures(self):
+        perps = self.cfg.get("perps") or []
+        if not perps:
+            return
+        coin = self.symbol.split("/")[0]
+        sym = next((p for p in perps if p == f"{coin}-PERP"), perps[0])
+        sym2 = next((p for p in perps if p != sym), sym)
+        a = self.a
+        print(color("1", f"合约（{sym} / {sym2}，账号 {SMOKE_USERS[0]}）"))
+        inst = {i["symbol"]: i for i in a.get("/api/instruments")["instruments"]}
+
+        def ticker(s):
+            return next(x for x in a.get("/api/tickers")["tickers"] if x["symbol"] == s)
+
+        def pos(s):
+            return next((p for p in a.get("/api/futures/account")["positions"] if p["symbol"] == s), None)
+
+        def qty_for(s, value=200):
+            i = inst[s]
+            return max(ceil_to(Decimal(value) / D(ticker(s)["ask"]), D(i["qty_increment"])), D(i["qty_min"]))
+
+        def wait_flat(s):
+            deadline = time.time() + 5
+            while pos(s) and time.time() < deadline:
+                time.sleep(0.2)
+            return pos(s) is None
+
+        def market():
+            t = {x["symbol"]: x for x in a.get("/api/tickers")["tickers"]}
+            for s in perps:
+                x = t.get(s)
+                expect(x and x["tradable"], f"{s} 不可交易")
+                expect(x["mark"] and x["index"] and x["funding_rate"] is not None and x["next_funding_ms"], f"{s} 缺少标记价、指数或资金费率")
+                dev = abs(D(x["mark"]) / D(x["index"]) - 1)
+                expect(dev < Decimal("0.02"), f"{s} 标记价偏离指数 {dev:.2%}")
+            i = inst.get(sym) or {}
+            expect(i.get("max_leverage") and i.get("margin_tiers"), f"{sym} 没有保证金档位")
+            rate = D(t[sym]["funding_rate"]) * 100
+            return f"{len(perps)} 个永续合约；{sym} 最高 {i['max_leverage']}x，资金费率 {rate:+.4f}%/h"
+
+        if not self.check("合约行情：标记价、指数、资金费率、保证金档位", market):
+            return
+
+        def transfer():
+            w0 = D(a.get("/api/futures/account")["wallet"])
+            usd0 = self.balance(a, "USD")[0]
+            a.post("/api/futures/transfer", {"amount": "2000", "to": "futures"})
+            acct = a.get("/api/futures/account")
+            expect(D(acct["wallet"]) - w0 == 2000, f"合约钱包增加 {D(acct['wallet']) - w0}，应为 2000")
+            expect(usd0 - self.balance(a, "USD")[0] == 2000, "现货 USD 没有减少 2000")
+            status, _ = a.call("POST", "/api/futures/transfer", {"amount": fmt(D(acct["available"]) + 1), "to": "spot"})
+            expect(status == 400, "转出超过可用余额居然成功了")
+            return "现货 → 合约 2000 USD；超额转回被拒绝"
+
+        if not self.check("资金划转", transfer):
+            return
+
+        def settings():
+            status, _ = a.call("POST", "/api/futures/settings", {"symbol": sym, "margin_mode": "isolated", "leverage": 100000})
+            expect(status == 400, "超过上限的杠杆没有被拒绝")
+            a.post("/api/futures/settings", {"symbol": sym, "margin_mode": "isolated", "leverage": 10})
+            a.post("/api/futures/settings", {"symbol": sym2, "margin_mode": "cross", "leverage": 5})
+            st = a.get("/api/futures/account")["settings"]
+            expect((st[sym]["margin_mode"], st[sym]["leverage"]) == ("isolated", "10"), f"{sym} 设置是 {st[sym]}")
+            expect((st[sym2]["margin_mode"], st[sym2]["leverage"]) == ("cross", "5"), f"{sym2} 设置是 {st[sym2]}")
+            return f"{sym} 逐仓 10x，{sym2} 全仓 5x；非法杠杆被拒绝"
+
+        self.check("杠杆和保证金模式", settings)
+
+        def long_isolated():
+            qty = qty_for(sym)
+            o = self.place(a, symbol=sym, side="buy", type="market", qty=qty)
+            o = self.settle(a, o["id"], until=("filled", "canceled", "rejected"))
+            expect(o["status"] == "filled", f"开多单状态 {o['status']}：{o.get('reason')}")
+            p = pos(sym)
+            expect(p and p["side"] == "long" and D(p["size"]) == qty, f"持仓不对：{p}")
+            entry, margin, liq = D(p["entry"]), D(p["margin"]), D(p["liq_price"])
+            expect(abs(margin - qty * entry / 10) <= Decimal("0.01"), f"保证金 {margin}，按 10x 应为 {qty * entry / 10}")
+            expect(entry * Decimal("0.88") < liq < entry * Decimal("0.92"), f"10x 多单强平价 {liq} 应在开仓价下方约 9.5%")
+            return f"多 {fmt(qty)} @ {fmt(entry)}，保证金 {margin:.2f}，强平价 {liq:.2f}"
+
+        if self.check("逐仓开多：保证金和强平价", long_isolated):
+
+            def reduce_only():
+                status, d = a.call(
+                    "POST", "/api/orders",
+                    {"symbol": sym, "side": "buy", "type": "market", "qty": fmt(D(inst[sym]["qty_min"])), "reduce_only": True},
+                )
+                expect(status == 400 and "reduce-only" in (d.get("error") or ""), f"同方向只减仓单返回 {status} {d.get('error')}")
+                return "同方向的只减仓单被拒绝"
+
+            self.check("只减仓", reduce_only)
+
+            def close_long():
+                a.post("/api/futures/close", {"symbol": sym})
+                expect(wait_flat(sym), "平仓后仓位还在")
+                h = a.get("/api/futures/positions?limit=5")["positions"]
+                expect(h and (h[0]["symbol"], h[0]["side"], h[0]["reason"]) == (sym, "long", "closed"), f"仓位历史不对：{h[:1]}")
+                return f"净盈亏 {D(h[0]['net']):+.2f}（含手续费）"
+
+            self.check("一键平仓，进入仓位历史", close_long)
+
+        def short_cross():
+            qty = qty_for(sym2)
+            o = self.place(a, symbol=sym2, side="sell", type="market", qty=qty)
+            o = self.settle(a, o["id"], until=("filled", "canceled", "rejected"))
+            expect(o["status"] == "filled", f"开空单状态 {o['status']}：{o.get('reason')}")
+            p = pos(sym2)
+            expect(p and (p["side"], p["margin_mode"]) == ("short", "cross"), f"持仓不对：{p}")
+            expect(D(p["liq_price"]) > D(p["entry"]), f"空单强平价 {p['liq_price']} 应高于开仓价 {p['entry']}")
+            a.post("/api/futures/close", {"symbol": sym2})
+            expect(wait_flat(sym2), "平仓后仓位还在")
+            return f"空 {fmt(qty)} @ {fmt(D(p['entry']))}，强平价 {D(p['liq_price']):.2f}，已平仓"
+
+        self.check("全仓做空并平仓", short_cross)
+
+        def transfer_back():
+            acct = a.get("/api/futures/account")
+            expect(not acct["positions"], "还有没平掉的合约仓位")
+            amt = D(acct["wallet"])
+            if amt > 0:
+                a.post("/api/futures/transfer", {"amount": fmt(amt), "to": "spot"})
+            expect(D(a.get("/api/futures/account")["wallet"]) == 0, "合约钱包没有清空")
+            return f"转回现货 {amt:.2f} USD"
+
+        self.check("合约账户清空，资金转回现货", transfer_back)
+
     # ---- accounts and permissions
 
     def accounts(self):
@@ -683,6 +812,18 @@ class Run:
             if self.a and self.b:
                 for c in (self.a, self.b):
                     c.delete("/api/orders")
+                    # futures left over from an interrupted run: close positions, move the USD back
+                    if self.cfg.get("perps"):
+                        acct = c.get("/api/futures/account")
+                        for p in acct["positions"]:
+                            c.call("POST", "/api/futures/close", {"symbol": p["symbol"]})
+                            done.append(f"平掉剩余合约仓位 {p['symbol']}")
+                        deadline = time.time() + 5
+                        while acct["positions"] and time.time() < deadline:
+                            time.sleep(0.2)
+                            acct = c.get("/api/futures/account")
+                        if D(acct["available"]) > 0:
+                            c.call("POST", "/api/futures/transfer", {"amount": fmt(D(acct["available"])), "to": "spot"})
                 # sell any leftover position from an interrupted run
                 i = getattr(self, "_inst", None)
                 if i:
@@ -743,6 +884,7 @@ def main():
             return 2
         if run.market_data():
             run.trading()
+            run.futures()
         run.accounts()
     finally:
         run.cleanup()

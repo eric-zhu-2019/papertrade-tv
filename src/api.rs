@@ -7,6 +7,8 @@ use crate::candles::INTERVALS;
 use crate::config::Config;
 use crate::engine::{Event, OType, OrderReq, Shared, Status, Tif};
 use crate::feed::fetch_ohlc;
+use crate::futures::MarginMode;
+use crate::kfeed::fetch_perp_ohlc;
 use crate::util::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -96,6 +98,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/equity", get(equity))
         .route("/api/apikeys", get(list_keys).post(create_key))
         .route("/api/apikeys/:prefix", delete(delete_key))
+        .route("/api/futures/account", get(fut_account))
+        .route("/api/futures/transfer", post(fut_transfer))
+        .route("/api/futures/settings", post(fut_settings))
+        .route("/api/futures/close", post(fut_close))
+        .route("/api/futures/positions", get(fut_positions))
+        .route("/api/futures/funding", get(fut_funding))
         .route("/api/admin/users", get(admin_users))
         .route("/api/admin/users/:id/password", post(admin_password))
         .route("/api/admin/users/:id/disabled", post(admin_disabled))
@@ -122,6 +130,10 @@ async fn config(State(st): State<AppState>) -> Json<Value> {
         "registration_open": !st.cfg.invite_code.is_empty() || e.unused_invites() > 0,
         "quote": st.cfg.quote,
         "symbols": st.cfg.symbols,
+        "perps": st.cfg.perps,
+        "fut_maker_fee": st.cfg.fut_maker_fee.to_string(),
+        "fut_taker_fee": st.cfg.fut_taker_fee.to_string(),
+        "liq_fee": st.cfg.liq_fee.to_string(),
         "maker_fee": st.cfg.maker_fee.to_string(),
         "taker_fee": st.cfg.taker_fee.to_string(),
         "start_balance": st.cfg.start_balance.normalize().to_string(),
@@ -240,7 +252,7 @@ async fn delete_key(State(st): State<AppState>, a: Auth, Path(prefix): Path<Stri
 
 fn symbol_of(st: &AppState, q: &HashMap<String, String>) -> Result<String, ApiErr> {
     let s = q.get("symbol").map(|s| s.to_uppercase()).unwrap_or_default();
-    if st.cfg.symbols.contains(&s) {
+    if st.cfg.is_market(&s) {
         Ok(s)
     } else {
         Err(bad("unknown or missing symbol"))
@@ -249,8 +261,25 @@ fn symbol_of(st: &AppState, q: &HashMap<String, String>) -> Result<String, ApiEr
 
 async fn instruments(State(st): State<AppState>, _a: Auth) -> R {
     let e = st.engine.lock().unwrap();
-    let list: Vec<Value> =
-        st.cfg.symbols.iter().filter_map(|s| e.instruments.get(s)).map(|i| serde_json::to_value(i).unwrap()).collect();
+    let list: Vec<Value> = st
+        .cfg
+        .markets()
+        .filter_map(|s| e.instruments.get(s))
+        .map(|i| {
+            let mut v = serde_json::to_value(i).unwrap();
+            if let Some(p) = e.perps.get(&i.symbol) {
+                v["kraken_product"] = json!(p.product);
+                v["max_leverage"] = json!(p.max_leverage().to_string());
+                v["max_position"] = json!(p.max_position.map(|m| m.normalize().to_string()));
+                v["margin_tiers"] = json!(p
+                    .tiers
+                    .iter()
+                    .map(|t| json!({"from_value": t.0.normalize().to_string(), "initial": t.1.to_string(), "maintenance": t.2.to_string()}))
+                    .collect::<Vec<_>>());
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({"instruments": list})))
 }
 
@@ -283,7 +312,8 @@ async fn candles(State(st): State<AppState>, _a: Auth, Query(q): Q) -> R {
         e.candles.seeded_at(&s, iv).map(|t| now - t > 6 * 3_600_000).unwrap_or(true)
     };
     if stale && st.cfg.feed != "sim" {
-        match fetch_ohlc(&st.http, &s, iv).await {
+        let fetched = if st.cfg.is_perp(&s) { fetch_perp_ohlc(&st.http, &s, iv).await } else { fetch_ohlc(&st.http, &s, iv).await };
+        match fetched {
             Ok(hist) => st.engine.lock().unwrap().candles.seed(&s, iv, hist, now),
             Err(err) => tracing::warn!("could not load candle history for {s} {iv}m: {err}"),
         }
@@ -328,9 +358,15 @@ async fn place_order(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) 
             Some(s) => Tif::parse(&s.to_lowercase()).ok_or_else(|| bad("time_in_force must be gtc, ioc or fok"))?,
         },
         post_only: b["post_only"].as_bool().unwrap_or(false),
+        reduce_only: b["reduce_only"].as_bool().unwrap_or(false),
         note: b["note"].as_str().map(|s| s.to_string()),
     };
-    let order = st.engine.lock().unwrap().place_order(a.0.id, req, now_ms()).map_err(bad)?;
+    submit(&st, a.0.id, req)
+}
+
+/// Accept an order and let it reach the book after the simulated latency.
+fn submit(st: &AppState, uid: i64, req: OrderReq) -> R {
+    let order = st.engine.lock().unwrap().place_order(uid, req, now_ms()).map_err(bad)?;
     if order.status == Status::Pending {
         // simulated network + gateway latency before the order reaches the book
         let (lo, hi) = (st.cfg.latency_min_ms, st.cfg.latency_max_ms.max(st.cfg.latency_min_ms));
@@ -388,6 +424,76 @@ async fn equity(State(st): State<AppState>, a: Auth, Query(q): Q) -> R {
     // equity curves are visible to all club members; holdings and orders are not
     let uid = q.get("user_id").and_then(|d| d.parse().ok()).unwrap_or(a.0.id);
     Ok(Json(json!({"user_id": uid, "points": st.engine.lock().unwrap().equity_curve(uid)})))
+}
+
+// ------------------------------------------------------------------ futures
+
+fn perp_of(st: &AppState, b: &Value) -> Result<String, ApiErr> {
+    let s = field(b, "symbol").to_uppercase();
+    if st.cfg.is_perp(&s) {
+        Ok(s)
+    } else {
+        Err(bad("symbol must be a perpetual, e.g. BTC-PERP"))
+    }
+}
+
+async fn fut_account(State(st): State<AppState>, a: Auth) -> R {
+    Ok(Json(st.engine.lock().unwrap().fut_account_json(a.0.id)))
+}
+
+/// {"amount": "1000", "to": "futures" | "spot"}
+async fn fut_transfer(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
+    let amount = dec(&b["amount"]).ok_or_else(|| bad("amount is required"))?;
+    let to_futures = match field(&b, "to") {
+        "futures" => true,
+        "spot" => false,
+        _ => return Err(bad("to must be futures or spot")),
+    };
+    let mut e = st.engine.lock().unwrap();
+    e.fut_transfer(a.0.id, amount, to_futures, now_ms()).map_err(bad)?;
+    Ok(Json(e.fut_account_json(a.0.id)))
+}
+
+/// {"symbol": "BTC-PERP", "margin_mode": "isolated" | "cross", "leverage": 10}
+async fn fut_settings(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
+    let symbol = perp_of(&st, &b)?;
+    let mode = MarginMode::parse(field(&b, "margin_mode")).ok_or_else(|| bad("margin_mode must be isolated or cross"))?;
+    let leverage = dec(&b["leverage"]).ok_or_else(|| bad("leverage is required"))?;
+    let mut e = st.engine.lock().unwrap();
+    e.set_fut_settings(a.0.id, &symbol, mode, leverage).map_err(bad)?;
+    Ok(Json(e.fut_account_json(a.0.id)))
+}
+
+/// Close the whole position on a perp with a reduce-only market order.
+async fn fut_close(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
+    let symbol = perp_of(&st, &b)?;
+    let size = {
+        let e = st.engine.lock().unwrap();
+        e.positions.get(&(a.0.id, symbol.clone())).map(|p| p.size).ok_or_else(|| bad("no open position on this market"))?
+    };
+    let req = OrderReq {
+        symbol,
+        side: if size > rust_decimal::Decimal::ZERO { Side::Sell } else { Side::Buy },
+        otype: OType::Market,
+        qty: size.abs(),
+        limit_price: None,
+        trigger_price: None,
+        tif: Tif::Gtc,
+        post_only: false,
+        reduce_only: true,
+        note: b["note"].as_str().map(|s| s.to_string()).or(Some("close position".into())),
+    };
+    submit(&st, a.0.id, req)
+}
+
+async fn fut_positions(State(st): State<AppState>, a: Auth, Query(q): Q) -> R {
+    let limit = q.get("limit").and_then(|d| d.parse().ok()).unwrap_or(100i64).clamp(1, 500);
+    Ok(Json(json!({"positions": st.engine.lock().unwrap().position_history(a.0.id, limit)})))
+}
+
+async fn fut_funding(State(st): State<AppState>, a: Auth, Query(q): Q) -> R {
+    let limit = q.get("limit").and_then(|d| d.parse().ok()).unwrap_or(100i64).clamp(1, 500);
+    Ok(Json(json!({"funding": st.engine.lock().unwrap().funding_history(a.0.id, limit)})))
 }
 
 // ------------------------------------------------------------------ admin
@@ -487,7 +593,7 @@ async fn ws_conn(st: AppState, mut sock: WebSocket) {
                         },
                         Some("subscribe") if user.is_some() => {
                             let s = v["symbol"].as_str().unwrap_or("").to_uppercase();
-                            if st.cfg.symbols.contains(&s) {
+                            if st.cfg.is_market(&s) {
                                 let tape: Vec<Value> = e.tape.get(&s).map(|t| t.iter().cloned().collect()).unwrap_or_default();
                                 let msgs = vec![
                                     e.book_json(&s, 25).to_string(),

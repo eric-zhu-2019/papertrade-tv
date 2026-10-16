@@ -10,7 +10,8 @@ const S = {
   token: store.get("pt_token"),
   lang: store.get("pt_lang") || ((navigator.language || "en").startsWith("zh") ? "zh" : "en"),
   symbol: store.get("pt_symbol"), interval: +store.get("pt_interval") || 15,
-  me: null, cfg: null, inst: {}, tickers: {}, feedOk: true, side: "buy", tab: "open", view: "trade",
+  me: null, cfg: null, inst: {}, tickers: {}, feedOk: true, futFeedOk: true, side: "buy", tab: "open", view: "trade",
+  fut: null, // futures account: wallet, positions, settings
   book: { bids: [], asks: [] }, tape: [], candles: [], portfolio: null,
   sort: { key: "return_pct", dir: -1 }, board: null, boardSel: null, authMode: "login",
 };
@@ -31,7 +32,10 @@ const cls = (x) => (x > 0 ? "up" : x < 0 ? "down" : "");
 const pad = (n) => String(n).padStart(2, "0");
 const fmtTime = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
 const fmtDT = (ms) => { const d = new Date(ms); return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${fmtTime(ms)}`; };
-const base = (sym) => sym.split("/")[0];
+const base = (sym) => sym.split("/")[0].replace(/-PERP$/, "");
+const isPerp = (sym) => !!(S.cfg && S.cfg.perps.includes(sym));
+const signUsd = (x) => (x == null ? "–" : (+x > 0 ? "+" : "") + fmtUsd(x));
+const position = (sym) => (S.fut ? S.fut.positions.find((p) => p.symbol === sym) : null);
 const floorTo = (x, dp) => Math.floor(x * 10 ** dp + 1e-9) / 10 ** dp;
 
 async function api(path, opts = {}) {
@@ -124,7 +128,8 @@ async function startApp() {
   $("#nav-admin").classList.toggle("hidden", !S.me.is_admin);
   $("#season-pill").textContent = S.cfg.season.name;
   await loadInstruments();
-  if (!S.cfg.symbols.includes(S.symbol)) S.symbol = S.cfg.symbols[0];
+  if (!S.cfg.symbols.includes(S.symbol) && !isPerp(S.symbol)) S.symbol = S.cfg.symbols[0];
+  $$(".perp-only").forEach((el) => el.classList.toggle("hidden", !S.cfg.perps.length));
   $("#intervals").innerHTML = S.cfg.intervals.map((i) => `<button data-iv="${i}" class="${i === S.interval ? "on" : ""}">${i < 60 ? i + "m" : i < 1440 ? i / 60 + "h" : "1D"}</button>`).join("");
   if (!S.chart) initChart();
   applyLang();
@@ -136,7 +141,7 @@ async function startApp() {
 async function loadInstruments() {
   const r = await api("/instruments");
   for (const i of r.instruments) S.inst[i.symbol] = i;
-  if (r.instruments.length < S.cfg.symbols.length) setTimeout(() => S.me && loadInstruments().then(() => { updateForm(); loadCandles(); }), 3000);
+  if (r.instruments.length < S.cfg.symbols.length + S.cfg.perps.length) setTimeout(() => S.me && loadInstruments().then(() => { updateForm(); loadCandles(); }), 3000);
 }
 
 function connectWS() {
@@ -154,7 +159,7 @@ function onMessage(m) {
       if (m.ok) S.ws.send(JSON.stringify({ op: "subscribe", symbol: S.symbol }));
       break;
     case "tickers":
-      S.feedOk = m.feed_ok;
+      S.feedOk = m.feed_ok; S.futFeedOk = m.fut_feed_ok;
       for (const x of m.tickers) S.tickers[x.symbol] = x;
       renderMarkets(); renderBanner(); renderSymHead();
       break;
@@ -175,6 +180,13 @@ function onMessage(m) {
       refreshSoon();
       break;
     }
+    case "liquidation":
+      toast(`${t("liquidated")}: ${m.symbol} ${t(m.side)} ${fmtQty(m.size)} @ ${fmtPrice(m.symbol, m.mark)}`, "bad");
+      refreshSoon();
+      break;
+    case "futures":
+      refreshSoon();
+      break;
     case "order": {
       const o = m.order;
       if (o.status === "rejected" || (o.status === "canceled" && o.reason && !/by user/.test(o.reason))) toast(`#${o.id} ${t("s_" + o.status)}: ${o.reason}`, "bad");
@@ -186,13 +198,25 @@ function onMessage(m) {
 
 // ---------------------------------------------------------------- markets, book, tape
 function renderMarkets() {
-  $("#markets").innerHTML = S.cfg.symbols.map((s) => {
+  const perp = isPerp(S.symbol);
+  const seg = S.cfg.perps.length
+    ? `<div class="seg mkt-seg"><button data-mk="spot" class="${perp ? "" : "on"}">${esc(t("spot"))}</button><button data-mk="perp" class="${perp ? "on" : ""}">${esc(t("perps"))}</button></div>`
+    : "";
+  $("#markets").innerHTML = seg + (perp ? S.cfg.perps : S.cfg.symbols).map((s) => {
     const x = S.tickers[s] || {};
     const ch = x.change_pct == null ? null : +x.change_pct;
     return `<div class="mkt ${s === S.symbol ? "on" : ""}" data-sym="${esc(s)}"><b>${esc(s)}</b><span>${fmtPrice(s, x.last)}</span><span></span><span class="${cls(ch)}">${pct(ch)}</span></div>`;
   }).join("");
 }
-$("#markets").addEventListener("click", (e) => { const m = e.target.closest(".mkt"); if (m) selectSymbol(m.dataset.sym); });
+$("#markets").addEventListener("click", (e) => {
+  const mk = e.target.dataset.mk;
+  if (mk) {
+    if ((mk === "perp") === isPerp(S.symbol)) return;
+    const last = store.get("pt_sym_" + mk), list = mk === "perp" ? S.cfg.perps : S.cfg.symbols;
+    return selectSymbol(list.includes(last) ? last : list[0]);
+  }
+  const m = e.target.closest(".mkt"); if (m) selectSymbol(m.dataset.sym);
+});
 
 function renderSymHead() {
   const x = S.tickers[S.symbol] || {};
@@ -200,7 +224,14 @@ function renderSymHead() {
   $("#sym-last").textContent = fmtPrice(S.symbol, x.last);
   const ch = x.change_pct == null ? null : +x.change_pct;
   $("#sym-chg").textContent = pct(ch); $("#sym-chg").className = cls(ch);
-  $("#sym-stats").textContent = x.high ? `24h  H ${fmtPrice(S.symbol, x.high)}  L ${fmtPrice(S.symbol, x.low)}  Vol ${num(x.volume, 0, 2)} ${base(S.symbol)}` : "";
+  if (isPerp(S.symbol)) {
+    const left = x.next_funding_ms ? Math.max(0, x.next_funding_ms - Date.now()) : null;
+    const mm = left == null ? "" : `${pad(Math.floor(left / 60000))}:${pad(Math.floor(left / 1000) % 60)}`;
+    const fr = x.funding_rate == null ? null : +x.funding_rate * 100;
+    $("#sym-stats").innerHTML = `${esc(t("mark_price"))} <b>${fmtPrice(S.symbol, x.mark)}</b> · ${esc(t("index_price"))} ${fmtPrice(S.symbol, x.index)} · ${esc(t("funding_rate"))} <b class="${cls(fr)}">${fr == null ? "–" : (fr > 0 ? "+" : "") + fr.toFixed(4) + "%"}</b>/1h ${mm ? `· ${esc(t("next_funding"))} ${mm}` : ""} · ${esc(t("max_lev"))} ${esc(x.max_leverage || "–")}x`;
+  } else {
+    $("#sym-stats").textContent = x.high ? `24h  H ${fmtPrice(S.symbol, x.high)}  L ${fmtPrice(S.symbol, x.low)}  Vol ${num(x.volume, 0, 2)} ${base(S.symbol)}` : "";
+  }
   const eq = S.portfolio ? +S.portfolio.equity : null;
   if (eq != null) {
     const r = (eq / +S.cfg.start_balance - 1) * 100;
@@ -211,16 +242,18 @@ function renderSymHead() {
 
 function renderBanner() {
   const b = $("#banner");
-  const msg = !S.feedOk ? t("feed_down") : S.cfg.simulated_feed ? t("feed_sim") : "";
-  b.textContent = msg; b.className = "banner" + (msg ? "" : " hidden") + (!S.feedOk ? " bad" : "");
-  $("#feed-dot").className = "dot " + (S.feedOk ? "ok" : "bad");
+  const perp = isPerp(S.symbol), ok = perp ? S.futFeedOk : S.feedOk;
+  const msg = !ok ? t(perp ? "fut_feed_down" : "feed_down") : S.cfg.simulated_feed ? t("feed_sim") : "";
+  b.textContent = msg; b.className = "banner" + (msg ? "" : " hidden") + (!ok ? " bad" : "");
+  const all = S.feedOk && (!S.cfg.perps.length || S.futFeedOk);
+  $("#feed-dot").className = "dot " + (all ? "ok" : "bad");
 }
 
 function selectSymbol(sym) {
-  S.symbol = sym; store.set("pt_symbol", sym);
+  S.symbol = sym; store.set("pt_symbol", sym); store.set("pt_sym_" + (isPerp(sym) ? "perp" : "spot"), sym);
   S.book = { bids: [], asks: [] }; S.tape = [];
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ op: "subscribe", symbol: sym }));
-  renderMarkets(); renderSymHead(); renderBook(); renderTape(); updateForm(); loadCandles();
+  renderMarkets(); renderSymHead(); renderBanner(); renderBook(); renderTape(); updateForm(); loadCandles();
 }
 
 let bookQueued = false;
@@ -306,19 +339,41 @@ function assetAvail(asset) {
   const a = S.portfolio && S.portfolio.assets.find((x) => x.asset === asset);
   return a ? +a.available : 0;
 }
+function futSettings(sym) {
+  return S.fut && S.fut.settings[sym] ? S.fut.settings[sym] : { margin_mode: "isolated", leverage: "10", max_leverage: "10" };
+}
 function updateForm() {
-  const type = form.type.value, sym = S.symbol;
+  const type = form.type.value, sym = S.symbol, perp = isPerp(sym);
   const hasLimit = type.includes("limit"), isStop = type !== "limit" && type !== "market";
   $("#row-price").classList.toggle("hidden", !hasLimit);
   $("#row-trigger").classList.toggle("hidden", !isStop);
   $("#row-tif").classList.toggle("hidden", type !== "limit");
   $("#qty-unit").textContent = base(sym);
+  $("#row-margin").classList.toggle("hidden", !perp);
+  $("#row-reduce").classList.toggle("hidden", !perp);
+  $("#fut-panel").classList.toggle("hidden", !perp);
   const btn = $("#submit-order");
-  btn.textContent = `${t(S.side)} ${base(sym)}`;
+  const [buyLbl, sellLbl] = perp ? [t("buy_long"), t("sell_short")] : [t("buy"), t("sell")];
+  $('#side-seg [data-side="buy"]').textContent = buyLbl;
+  $('#side-seg [data-side="sell"]').textContent = sellLbl;
+  const reduce = perp && form.reduce_only.checked;
+  btn.textContent = perp
+    ? `${t(reduce ? (S.side === "buy" ? "close_short" : "close_long") : S.side === "buy" ? "open_long" : "open_short")} ${base(sym)}`
+    : `${t(S.side)} ${base(sym)}`;
   btn.className = "primary " + S.side;
   $$("#side-seg button").forEach((b) => b.classList.toggle("on", b.dataset.side === S.side));
-  const asset = S.side === "buy" ? S.cfg.quote : base(sym);
-  $("#avail").textContent = `${t("avail_lbl")}: ${num(assetAvail(asset), 0, 8)} ${asset}`;
+  if (perp) {
+    const st = futSettings(sym);
+    if (document.activeElement !== form.margin_mode) form.margin_mode.value = st.margin_mode;
+    if (document.activeElement !== form.leverage) form.leverage.value = st.leverage;
+    form.leverage.max = st.max_leverage;
+    $("#max-lev").textContent = `≤ ${st.max_leverage}x`;
+    $("#avail").textContent = `${t("fut_avail")}: ${S.fut ? fmtUsd(S.fut.available) : "–"} ${S.cfg.quote}`;
+    renderFutPanel();
+  } else {
+    const asset = S.side === "buy" ? S.cfg.quote : base(sym);
+    $("#avail").textContent = `${t("avail_lbl")}: ${num(assetAvail(asset), 0, 8)} ${asset}`;
+  }
   form.note.required = S.cfg.require_note;
   updateEstimate();
 }
@@ -342,8 +397,15 @@ function updateEstimate() {
   if (!px) { el.textContent = type === "market" ? "–" : ""; return; }
   const cost = qty * px;
   const maker = type === "limit" && form.post_only.checked;
+  const slip = type === "market" ? ` · ${t("est_slip")} ${fmtPrice(S.symbol, px)}` : "";
+  if (isPerp(S.symbol)) {
+    const fee = cost * +(maker ? S.cfg.fut_maker_fee : S.cfg.fut_taker_fee);
+    const margin = form.reduce_only.checked ? 0 : cost / Math.max(1, +form.leverage.value || 1);
+    el.textContent = `${t("value")} $${fmtUsd(cost)} · ${t("est_margin")} ≈ $${fmtUsd(margin)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
+    return;
+  }
   const fee = cost * +(maker ? S.cfg.maker_fee : S.cfg.taker_fee);
-  el.textContent = `${t("est_cost")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + (type === "market" ? ` · ${t("est_slip")} ${fmtPrice(S.symbol, px)}` : "");
+  el.textContent = `${t("est_cost")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
 }
 form.addEventListener("input", updateForm);
 $("#side-seg").addEventListener("click", (e) => { if (e.target.dataset.side) { S.side = e.target.dataset.side; updateForm(); } });
@@ -352,6 +414,18 @@ $("#pcts").addEventListener("click", (e) => {
   const inst = S.inst[S.symbol]; if (!inst) return;
   const dp = Math.min(inst.qty_precision, 6);
   let q;
+  if (isPerp(S.symbol)) {
+    const pos = position(S.symbol);
+    if (form.reduce_only.checked) q = pos ? +pos.size * p : 0;
+    else {
+      let px = refPrice(); if (!px || !S.fut) return;
+      if (form.type.value === "market") px *= 1.003;
+      const lev = Math.max(1, +form.leverage.value || 1);
+      q = (+S.fut.available * p) / (px * (1 / lev + +S.cfg.fut_taker_fee)) * 0.999;
+    }
+    form.qty.value = String(floorTo(q, dp));
+    return updateEstimate();
+  }
   if (S.side === "sell") q = assetAvail(base(S.symbol)) * p;
   else {
     let px = refPrice(); if (!px) return;
@@ -369,12 +443,52 @@ form.addEventListener("submit", async (e) => {
   if (type.includes("limit")) body.limit_price = f.limit_price.trim();
   if (type !== "limit" && type !== "market") body.trigger_price = f.trigger_price.trim();
   if (type === "limit") { body.time_in_force = f.time_in_force; body.post_only = !!f.post_only; }
+  if (isPerp(S.symbol)) body.reduce_only = !!f.reduce_only;
   const err = $("#order-err"); err.textContent = "";
   try {
     const r = await api("/orders", { method: "POST", body });
     toast(`${t("order_sent")} #${r.order.id}`);
     form.qty.value = ""; form.note.value = "";
     updateEstimate(); refreshSoon();
+  } catch (ex) { err.textContent = ex.message; }
+});
+
+// ---------------------------------------------------------------- futures account
+async function saveFutSettings() {
+  const err = $("#order-err"); err.textContent = "";
+  try {
+    S.fut = await api("/futures/settings", { method: "POST", body: { symbol: S.symbol, margin_mode: form.margin_mode.value, leverage: Math.round(+form.leverage.value) } });
+    toast(`${S.symbol}: ${t(form.margin_mode.value)} ${Math.round(+form.leverage.value)}x`);
+  } catch (ex) { err.textContent = ex.message; }
+  form.margin_mode.blur(); form.leverage.blur();
+  updateForm();
+}
+form.margin_mode.addEventListener("change", saveFutSettings);
+form.leverage.addEventListener("change", saveFutSettings);
+
+function renderFutPanel() {
+  const a = S.fut; if (!a) return;
+  const u = +a.unrealized_pnl;
+  $("#fut-stats").innerHTML = [
+    [t("fut_equity"), "$" + fmtUsd(a.equity)], [t("fut_avail"), "$" + fmtUsd(a.available)],
+    [t("margin_used"), "$" + fmtUsd(a.margin_used)], [t("pnl"), `<span class="${cls(u)}">${signUsd(a.unrealized_pnl)}</span>`],
+  ].map(([k, v]) => `<div><span>${esc(k)}</span><b>${v}</b></div>`).join("");
+  // first visit with an empty futures wallet: show how to fund it, once
+  if (!S.futHinted && +a.wallet === 0 && !a.positions.length) { S.futHinted = true; $("#fut-transfer").open = true; }
+}
+$("#transfer-max").addEventListener("click", () => {
+  const f = $("#transfer-form");
+  const max = f.to.value === "futures" ? assetAvail(S.cfg.quote) : S.fut ? +S.fut.available : 0;
+  f.amount.value = String(floorTo(max, 2));
+});
+$("#transfer-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target, err = $("#transfer-err"); err.textContent = "";
+  try {
+    S.fut = await api("/futures/transfer", { method: "POST", body: { amount: f.amount.value.trim(), to: f.to.value } });
+    toast(`${t("transfer")}: $${fmtUsd(f.amount.value)} ${t(f.to.value === "futures" ? "to_futures" : "to_spot")}`, "good");
+    f.amount.value = "";
+    refresh();
   } catch (ex) { err.textContent = ex.message; }
 });
 
@@ -405,6 +519,32 @@ const TABS = {
     { h: t("cost"), f: (x) => fmtUsd(x.cost) }, { h: t("fee"), f: (x) => num(x.fee, 2, 4) },
     { h: t("role"), f: (x) => esc(t(x.liquidity)) }, { h: t("note"), c: "txt", f: (x) => esc(x.note) },
   ] },
+  positions: { load: () => api("/futures/account").then((r) => { S.fut = r; return r.positions; }), cols: () => [
+    { h: t("market"), c: "name", f: (p) => `<a href="#" data-go="${esc(p.symbol)}">${esc(p.symbol)}</a>` },
+    { h: t("side"), f: (p) => `<span class="${p.side === "long" ? "up" : "down"}">${esc(t(p.side))}</span>` },
+    { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
+    { h: t("mark_price"), f: (p) => fmtPrice(p.symbol, p.mark) },
+    { h: t("liq_price"), f: (p) => (p.liq_price ? `<span class="down">${fmtPrice(p.symbol, p.liq_price)}</span>` : "–") },
+    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode))} ${esc(p.leverage)}x</span>` },
+    { h: t("pnl"), f: (p) => `<span class="${cls(+p.unrealized_pnl)}">${signUsd(p.unrealized_pnl)} (${pct(+p.roe_pct)})</span>` },
+    { h: t("funding"), f: (p) => `<span class="${cls(+p.funding)}">${signUsd(p.funding)}</span>` },
+    { h: "", f: (p) => `<button data-close="${esc(p.symbol)}">${esc(t("close_pos"))}</button>` },
+  ] },
+  pos_history: { load: () => api("/futures/positions?limit=200").then((r) => r.positions), cols: () => [
+    { h: t("time"), f: (p) => fmtDT(p.closed_ms) }, { h: t("market"), f: (p) => esc(p.symbol) },
+    { h: t("side"), f: (p) => `<span class="${p.side === "long" ? "up" : "down"}">${esc(t(p.side))}</span>` },
+    { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
+    { h: t("exit_price"), f: (p) => fmtPrice(p.symbol, p.exit) },
+    { h: t("net_pnl"), f: (p) => `<b class="${cls(+p.net)}">${signUsd(p.net)}</b>` }, { h: t("realized"), f: (p) => signUsd(p.realized) },
+    { h: t("fee"), f: (p) => fmtUsd(p.fees) }, { h: t("funding"), f: (p) => signUsd(p.funding) },
+    { h: t("margin"), f: (p) => `${esc(t(p.margin_mode))} ${esc(p.leverage)}x` },
+    { h: t("reason"), c: "txt", f: (p) => `<span class="${p.reason === "liquidated" ? "down" : ""}">${esc(t("r_" + p.reason))}</span>` },
+  ] },
+  funding: { load: () => api("/futures/funding?limit=200").then((r) => r.funding), cols: () => [
+    { h: t("time"), f: (x) => fmtDT(x.ts) }, { h: t("market"), f: (x) => esc(x.symbol) },
+    { h: t("rate"), f: (x) => (+x.rate * 100).toFixed(4) + "%" }, { h: t("mark_price"), f: (x) => fmtPrice(x.symbol, x.mark) },
+    { h: t("amount_col"), f: (x) => `<span class="${cls(+x.amount)}">${signUsd(x.amount)}</span>` },
+  ] },
   balances: { load: () => api("/portfolio").then((r) => r.assets), cols: () => [
     { h: t("asset"), f: (a) => `<b>${esc(a.asset)}</b>` }, { h: t("total"), f: (a) => fmtQty(a.total) },
     { h: t("available"), f: (a) => fmtQty(a.available) }, { h: t("in_orders"), f: (a) => fmtQty(a.locked) },
@@ -418,6 +558,7 @@ async function loadTab() {
   const tab = S.tab;
   try { const rows = await TABS[tab].load(); if (tab === S.tab) { tabRows = rows; renderTab(); } } catch {}
   if (tab !== "open") api("/orders").then((r) => ($("#open-count").textContent = r.orders.length || "")).catch(() => {});
+  $("#pos-count").textContent = S.fut && S.fut.positions.length ? S.fut.positions.length : "";
 }
 function renderTab() {
   table($("#tab-table"), TABS[S.tab].cols(), tabRows);
@@ -430,7 +571,18 @@ $("#tabs").addEventListener("click", (e) => {
   $$("#tabs [data-tab]").forEach((x) => x.classList.toggle("on", x === b));
   renderTab(); loadTab();
 });
+let closeArmed = null;
 $("#tab-table").addEventListener("click", async (e) => {
+  const go = e.target.dataset.go;
+  if (go) { e.preventDefault(); return selectSymbol(go); }
+  const sym = e.target.dataset.close;
+  if (sym) {
+    // closing at market is not undoable: ask for a second click
+    if (closeArmed !== sym) { closeArmed = sym; e.target.textContent = t("confirm_close"); setTimeout(() => { if (closeArmed === sym) { closeArmed = null; renderTab(); } }, 3000); return; }
+    closeArmed = null;
+    try { const r = await api("/futures/close", { method: "POST", body: { symbol: sym } }); toast(`${t("order_sent")} #${r.order.id}`); } catch (ex) { toast(ex.message, "bad"); }
+    return refreshSoon();
+  }
   const id = e.target.dataset.cancel; if (!id) return;
   try { await api("/orders/" + id, { method: "DELETE" }); } catch (ex) { toast(ex.message, "bad"); }
   refreshSoon();
@@ -439,7 +591,11 @@ $("#cancel-all").addEventListener("click", async () => { try { await api("/order
 
 async function refresh() {
   if (!S.me) return;
-  try { S.portfolio = await api("/portfolio"); renderSymHead(); updateForm(); } catch {}
+  try {
+    const [p, f] = await Promise.all([api("/portfolio"), S.cfg.perps.length ? api("/futures/account") : null]);
+    S.portfolio = p; if (f) S.fut = f;
+    renderSymHead(); updateForm();
+  } catch {}
   if (S.view === "trade") loadTab();
 }
 let refreshTimer = null;
@@ -533,6 +689,14 @@ GET    /api/orders                 open orders          GET /api/orders?status=c
 GET    /api/orders/{id}            one order            DELETE /api/orders/{id}         cancel
 DELETE /api/orders                 cancel all           GET /api/fills                  your fills
 GET    /api/tickers | /api/instruments | /api/trades?symbol= | /api/candles?symbol=&interval=1|5|15|60|240|1440
+
+# Perpetual futures (symbols like BTC-PERP; a separate USD wallet; 1 contract = 1 coin)
+POST /api/futures/transfer  {"amount":"1000","to":"futures"|"spot"}
+POST /api/futures/settings  {"symbol":"BTC-PERP","margin_mode":"isolated"|"cross","leverage":10}
+GET  /api/futures/account   wallet, available margin, positions with liquidation prices
+POST /api/orders            same as spot, with "symbol":"BTC-PERP" and optional "reduce_only":true
+POST /api/futures/close     {"symbol":"BTC-PERP"}   market-close the whole position
+GET  /api/futures/positions | /api/futures/funding   closed positions, funding payments
 
 # Live stream: connect to ${o.replace(/^http/, "ws")}/ws and send
 #   {"op":"auth","token":"<your key>"}  then  {"op":"subscribe","symbol":"BTC/USD"}

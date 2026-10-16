@@ -64,8 +64,11 @@
       <div class="panel">
         <div class="tabs" id="tabs">
           <button data-tab="open" class="on"><span data-t="tab_open"></span> <span id="open-count" class="count"></span></button>
+          <button data-tab="positions" class="perp-only"><span data-t="tab_positions"></span> <span id="pos-count" class="count"></span></button>
           <button data-tab="history" data-t="tab_history"></button>
           <button data-tab="fills" data-t="tab_fills"></button>
+          <button data-tab="pos_history" class="perp-only" data-t="tab_pos_history"></button>
+          <button data-tab="funding" class="perp-only" data-t="tab_funding"></button>
           <button data-tab="balances" data-t="tab_balances"></button>
           <button class="link right-btn" id="cancel-all" data-t="cancel_all"></button>
         </div>
@@ -80,12 +83,32 @@
         <div id="spread" class="spread"></div>
         <div id="bids" class="book-side"></div>
       </div>
+      <div class="panel hidden" id="fut-panel">
+        <h3 data-t="fut_account"></h3>
+        <div class="fut-stats" id="fut-stats"></div>
+        <details id="fut-transfer"><summary data-t="transfer"></summary>
+          <p class="muted small" data-t="fut_hint"></p>
+          <form id="transfer-form" class="transfer">
+            <select name="to"><option value="futures" data-t="to_futures"></option><option value="spot" data-t="to_spot"></option></select>
+            <input name="amount" inputmode="decimal" autocomplete="off" data-tp="amount" required>
+            <button type="button" id="transfer-max" class="link">Max</button>
+            <button data-t="transfer"></button>
+          </form>
+          <p class="err" id="transfer-err"></p>
+        </details>
+      </div>
       <div class="panel form-panel">
         <div class="seg side-seg" id="side-seg">
           <button data-side="buy" class="on buy" data-t="buy"></button>
           <button data-side="sell" class="sell" data-t="sell"></button>
         </div>
         <form id="order-form">
+          <div class="row2 hidden" id="row-margin">
+            <label><span data-t="margin_mode"></span>
+              <select name="margin_mode"><option value="isolated" data-t="isolated"></option><option value="cross" data-t="cross"></option></select>
+            </label>
+            <label><span><span data-t="leverage"></span> <span id="max-lev" class="muted"></span></span><input name="leverage" type="number" min="1" step="1" inputmode="numeric"></label>
+          </div>
           <label><span data-t="order_type"></span>
             <select name="type">
               <option value="limit" data-t="t_limit"></option>
@@ -106,6 +129,7 @@
             </label>
             <label class="check"><input type="checkbox" name="post_only"> <span data-t="post_only"></span></label>
           </div>
+          <label class="check hidden" id="row-reduce"><input type="checkbox" name="reduce_only"> <span data-t="reduce_only"></span></label>
           <label><span data-t="note"></span><textarea name="note" rows="2" maxlength="500" data-tp="note_ph"></textarea></label>
           <div class="est muted small" id="est"></div>
           <div class="muted small" id="avail"></div>

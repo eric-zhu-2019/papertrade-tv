@@ -27,6 +27,15 @@ pub struct Config {
     pub snapshot_secs: u64,
     pub max_open_orders: usize,
     pub orders_per_sec: f64,
+    /// Perpetual futures, one per spot base asset ("BTC-PERP"); empty when FUTURES=0.
+    pub perps: Vec<String>,
+    pub fut_maker_fee: Decimal,
+    pub fut_taker_fee: Decimal,
+    /// Charged on the value of a liquidated position, paid into the insurance fund.
+    pub liq_fee: Decimal,
+    pub fut_default_leverage: Decimal,
+    /// FEED=sim only: seconds between simulated funding payments.
+    pub sim_funding_secs: i64,
 }
 
 fn var(k: &str, default: &str) -> String {
@@ -51,6 +60,11 @@ impl Config {
             );
         }
         let dec = |k: &str, dflt: &str| parse_dec(&var(k, dflt)).unwrap_or_else(|| panic!("bad {k}"));
+        let perps = if matches!(var("FUTURES", "1").as_str(), "0" | "false" | "no") {
+            vec![]
+        } else {
+            symbols.iter().filter_map(|s| s.split_once('/')).map(|(b, _)| format!("{b}-PERP")).collect()
+        };
         Config {
             bind: var("BIND", "0.0.0.0:8080"),
             db_path: var("DB_PATH", "data/papertrade.db"),
@@ -75,10 +89,40 @@ impl Config {
             snapshot_secs: var("SNAPSHOT_SECS", "300").parse().expect("SNAPSHOT_SECS"),
             max_open_orders: var("MAX_OPEN_ORDERS", "100").parse().expect("MAX_OPEN_ORDERS"),
             orders_per_sec: var("ORDERS_PER_SEC", "10").parse().expect("ORDERS_PER_SEC"),
+            perps,
+            // Kraken Futures entry-tier fees
+            fut_maker_fee: dec("FUT_MAKER_FEE", "0.0002"),
+            fut_taker_fee: dec("FUT_TAKER_FEE", "0.0005"),
+            liq_fee: dec("LIQ_FEE", "0.005"),
+            fut_default_leverage: dec("FUT_DEFAULT_LEVERAGE", "10"),
+            sim_funding_secs: var("SIM_FUNDING_SECS", "3600").parse().expect("SIM_FUNDING_SECS"),
         }
+    }
+
+    pub fn is_perp(&self, s: &str) -> bool {
+        self.perps.iter().any(|p| p == s)
+    }
+
+    /// Spot pairs and perps: every symbol that has a book.
+    pub fn markets(&self) -> impl Iterator<Item = &String> {
+        self.symbols.iter().chain(self.perps.iter())
+    }
+
+    pub fn is_market(&self, s: &str) -> bool {
+        self.symbols.iter().any(|x| x == s) || self.is_perp(s)
+    }
+
+    pub fn fut_max_fee(&self) -> Decimal {
+        self.fut_maker_fee.max(self.fut_taker_fee)
     }
 
     pub fn max_fee(&self) -> Decimal {
         self.maker_fee.max(self.taker_fee)
     }
+}
+
+/// Kraken Futures product id of a perp: "BTC-PERP" -> "PF_XBTUSD".
+pub fn perp_product(perp: &str) -> String {
+    let base = perp.trim_end_matches("-PERP");
+    format!("PF_{}USD", if base == "BTC" { "XBT" } else { base })
 }

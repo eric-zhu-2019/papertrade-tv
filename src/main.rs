@@ -5,6 +5,8 @@ mod candles;
 mod config;
 mod engine;
 mod feed;
+mod futures;
+mod kfeed;
 #[cfg(test)]
 mod tests;
 mod util;
@@ -38,13 +40,27 @@ async fn main() {
         tracing::warn!("INVITE_CODE is not set; self-registration is disabled");
     }
 
+    let http = reqwest::Client::new();
     match cfg.feed.as_str() {
         "sim" => {
             tokio::spawn(feed::run_sim(engine.clone(), cfg.clone()));
         }
         _ => {
             tokio::spawn(feed::run_kraken(engine.clone(), cfg.clone()));
+            if !cfg.perps.is_empty() {
+                tokio::spawn(kfeed::run_kraken_futures(engine.clone(), cfg.clone(), http.clone()));
+            }
         }
+    }
+    // perps: pay funding when it falls due and liquidate under-margined positions, once a second
+    if !cfg.perps.is_empty() {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                engine.lock().unwrap().fut_tick(now_ms());
+            }
+        });
     }
 
     // tickers + exchange status, once a second
@@ -73,7 +89,7 @@ async fn main() {
         });
     }
 
-    let state = api::AppState { engine, cfg: cfg.clone(), tx, http: reqwest::Client::new() };
+    let state = api::AppState { engine, cfg: cfg.clone(), tx, http };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await.expect("bind");
     tracing::info!("{} paper exchange listening on http://{}", cfg.club_name, cfg.bind);

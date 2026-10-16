@@ -3,6 +3,8 @@ use crate::book::{Book, Side};
 use crate::config::Config;
 use crate::engine::*;
 use crate::feed::handle_message;
+use crate::futures::MarginMode;
+use crate::kfeed::{apply_instruments, handle_fut_message};
 use crate::util::*;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -35,6 +37,12 @@ fn cfg() -> Config {
         snapshot_secs: 300,
         max_open_orders: 100,
         orders_per_sec: 1000.0,
+        perps: vec!["BTC-PERP".into()],
+        fut_maker_fee: d("0.0002"),
+        fut_taker_fee: d("0.0005"),
+        liq_fee: d("0.005"),
+        fut_default_leverage: d("10"),
+        sim_funding_secs: 3600,
     }
 }
 
@@ -48,6 +56,7 @@ fn setup() -> (Engine, i64) {
     let mut e = Engine::open(Arc::new(cfg()), tx, ":memory:");
     e.set_instrument(Instrument {
         symbol: "BTC/USD".into(),
+        kind: "spot",
         base: "BTC".into(),
         quote: "USD".into(),
         price_increment: d("0.1"),
@@ -74,6 +83,7 @@ fn req(side: Side, otype: OType, qty: &str, limit: Option<&str>) -> OrderReq {
         trigger_price: None,
         tif: Tif::Gtc,
         post_only: false,
+        reduce_only: false,
         note: None,
     }
 }
@@ -422,4 +432,305 @@ fn one_time_invites_work_once_and_only_when_the_account_is_created() {
     assert_eq!(e.unused_invites(), 0);
     assert_eq!(bal(&e, bob, "USD").0, d("100000"));
     audit(&e);
+}
+
+// ------------------------------------------------------------------ perpetual futures
+
+const PERP: &str = "BTC-PERP";
+
+/// A perp priced around 100 (100 contracts at bid 100.0 and ask 100.1, more behind),
+/// Kraken's BTC tiers, and 10,000 USD moved into alice's futures wallet.
+fn fut_setup() -> (Engine, i64) {
+    let (mut e, uid) = setup();
+    e.set_instrument(Instrument {
+        symbol: PERP.into(),
+        kind: "perp",
+        base: "BTC".into(),
+        quote: "USD".into(),
+        price_increment: d("0.1"),
+        qty_increment: d("0.001"),
+        qty_min: d("0.001"),
+        cost_min: Decimal::ZERO,
+        price_precision: 1,
+        qty_precision: 3,
+        status: "online".into(),
+    });
+    e.set_perp_rules(PERP, vec![(d("0"), d("0.01"), d("0.005")), (d("1000000"), d("0.02"), d("0.01"))], Some(d("1000")));
+    e.fut_feed_up(T0);
+    perp_book(&mut e, "100.0", "100.1");
+    perp_mark(&mut e, "100");
+    e.fut_transfer(uid, d("10000"), true, T0).unwrap();
+    (e, uid)
+}
+
+/// Replace the perp book with deep levels starting at `bid` / `ask`.
+fn perp_book(e: &mut Engine, bid: &str, ask: &str) {
+    let (b, a) = (d(bid), d(ask));
+    let bids = [(b, d("100")), (b - d("0.1"), d("20")), (b - d("1"), d("1000"))];
+    let asks = [(a, d("100")), (a + d("0.1"), d("20")), (a + d("1"), d("1000"))];
+    e.on_book_snapshot(PERP, &bids, &asks, T0);
+}
+
+fn perp_mark(e: &mut Engine, mark: &str) {
+    e.on_perp_ticker(PERP, Some(d(mark)), Some(d(mark)), None, None, None, Ticker::default());
+}
+
+fn preq(side: Side, otype: OType, qty: &str, limit: Option<&str>) -> OrderReq {
+    OrderReq { symbol: PERP.into(), ..req(side, otype, qty, limit) }
+}
+
+fn wallet(e: &Engine, uid: i64) -> Decimal {
+    e.fut.get(&uid).map(|a| a.wallet).unwrap_or_default()
+}
+
+fn pos_size(e: &Engine, uid: i64) -> Decimal {
+    e.positions.get(&(uid, PERP.to_string())).map(|p| p.size).unwrap_or_default()
+}
+
+fn new_trader(e: &mut Engine, name: &str, futures_usd: &str) -> i64 {
+    let uid = e.create_user(name, "x", false, T0).unwrap();
+    e.fut_transfer(uid, d(futures_usd), true, T0).unwrap();
+    uid
+}
+
+#[test]
+fn transfers_between_spot_and_futures_wallets() {
+    let (mut e, uid) = fut_setup();
+    assert_eq!(bal(&e, uid, "USD").0, d("90000"));
+    assert_eq!(wallet(&e, uid), d("10000"));
+    assert!(e.fut_transfer(uid, d("10000.01"), false, T0).is_err());
+    assert!(e.fut_transfer(uid, d("90000.01"), true, T0).is_err());
+    assert!(e.fut_transfer(uid, d("-5"), true, T0).is_err());
+    e.fut_transfer(uid, d("2500"), false, T0).unwrap();
+    assert_eq!(bal(&e, uid, "USD").0, d("92500"));
+    assert_eq!(wallet(&e, uid), d("7500"));
+    audit(&e);
+}
+
+#[test]
+fn isolated_long_opens_with_margin_and_closes_with_profit() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    // 10 @ 100.1 at 10x: margin 100.1, taker fee 0.05% of 1001
+    assert_eq!(pos_size(&e, uid), d("10"));
+    let p = e.positions[&(uid, PERP.to_string())].clone();
+    assert_eq!((p.entry, p.margin, p.mode), (d("100.1"), d("100.1"), MarginMode::Isolated));
+    assert_eq!(wallet(&e, uid), d("9899.3995"));
+    assert_eq!(e.fut[&uid].locked, Decimal::ZERO);
+    // liquidation price for an isolated long: (q*e - M) / (q * (1 - mm))
+    let liq = e.liq_price(&p).unwrap();
+    assert_eq!(liq.round_dp(4), d("90.5427"));
+
+    perp_book(&mut e, "110.0", "110.1");
+    perp_mark(&mut e, "110");
+    assert_eq!(e.fut_equity(uid), d("9899.3995") + d("100.1") + d("99"));
+    go(&mut e, uid, OrderReq { reduce_only: true, ..preq(Side::Sell, OType::Market, "10", None) });
+    assert!(e.positions.is_empty());
+    // +99 profit, -0.55 fee, margin back
+    assert_eq!(wallet(&e, uid), d("10097.9495"));
+    let h = e.position_history(uid, 10);
+    assert_eq!(h[0]["side"], "long");
+    assert_eq!(h[0]["realized"], "99");
+    assert_eq!(h[0]["fees"], "1.0505");
+    assert_eq!(h[0]["reason"], "closed");
+    audit(&e);
+    e.fut_transfer(uid, d("10097.9495"), false, T0).unwrap();
+    audit(&e);
+}
+
+#[test]
+fn cross_short_flips_to_long_in_one_order() {
+    let (mut e, uid) = fut_setup();
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("5")).unwrap();
+    go(&mut e, uid, preq(Side::Sell, OType::Market, "10", None));
+    assert_eq!(pos_size(&e, uid), d("-10"));
+    assert_eq!(wallet(&e, uid), d("9999.5")); // cross margin stays in the wallet; only the fee left
+    assert_eq!(e.fut_available(uid), d("9799.5")); // 1000 notional at 5x ties up 200
+    assert!(e.positions[&(uid, PERP.to_string())].margin.is_zero());
+
+    // buying 15 closes the short (-0.1 per contract) and opens a 5 long
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "15", None));
+    assert_eq!(pos_size(&e, uid), d("5"));
+    let p = &e.positions[&(uid, PERP.to_string())];
+    assert_eq!((p.entry, p.mode, p.long), (d("100.1"), MarginMode::Cross, true));
+    assert_eq!(wallet(&e, uid), d("9999.5") - d("1") - d("0.75075"));
+    let h = e.position_history(uid, 10);
+    assert_eq!((h[0]["side"].as_str(), h[0]["realized"].as_str()), (Some("short"), Some("-1")));
+    audit(&e);
+}
+
+#[test]
+fn reduce_only_orders_and_locked_settings() {
+    let (mut e, uid) = fut_setup();
+    let ro = |side, qty| OrderReq { reduce_only: true, ..preq(side, OType::Market, qty, None) };
+    assert!(e.place_order(uid, ro(Side::Sell, "1"), T0).is_err()); // nothing to reduce
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    assert!(e.place_order(uid, ro(Side::Buy, "1"), T0).is_err()); // same side would grow it
+    assert!(e.place_order(uid, ro(Side::Sell, "20"), T0).is_err()); // larger than the position
+    go(&mut e, uid, ro(Side::Sell, "4"));
+    assert_eq!(pos_size(&e, uid), d("6"));
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("20")).is_err());
+    assert!(e.place_order(uid, OrderReq { reduce_only: true, ..req(Side::Sell, OType::Market, "0.001", None) }, T0).is_err());
+    audit(&e);
+}
+
+#[test]
+fn leverage_limits_and_insufficient_margin() {
+    let (mut e, uid) = fut_setup();
+    for bad in ["101", "0", "2.5"] {
+        assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d(bad)).is_err(), "{bad}");
+    }
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("100")).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1")).unwrap();
+    // 1x: 200 contracts at ~100 needs ~20,000 of margin; the wallet has 10,000
+    let err = e.place_order(uid, preq(Side::Buy, OType::Limit, "200", Some("100.0")), T0).unwrap_err();
+    assert!(err.contains("insufficient futures margin"), "{err}");
+    // a resting limit order reserves margin + fee until it fills or is cancelled
+    let o = e.place_order(uid, preq(Side::Buy, OType::Limit, "50", Some("99.0")), T0).unwrap();
+    e.activate(o.id, T0);
+    assert_eq!(e.fut[&uid].locked, d("4950") + d("2.475"));
+    assert_eq!(e.fut_available(uid), d("10000") - d("4952.475"));
+    e.cancel_order(uid, o.id, T0).unwrap();
+    assert_eq!(e.fut[&uid].locked, Decimal::ZERO);
+    audit(&e);
+}
+
+#[test]
+fn resting_perp_limit_order_fills_from_real_trades_as_maker() {
+    let (mut e, uid) = fut_setup();
+    let id = go(&mut e, uid, preq(Side::Buy, OType::Limit, "5", Some("100.0")));
+    assert_eq!(order(&e, uid, id)["status"], "open");
+    e.on_trade(PERP, d("100.0"), d("95"), Side::Sell, T0, true, T0); // 95 of the 100 ahead of us
+    assert_eq!(pos_size(&e, uid), Decimal::ZERO);
+    e.on_trade(PERP, d("100.0"), d("8"), Side::Sell, T0, true, T0); // the last 5 ahead, then 3 for us
+    assert_eq!(pos_size(&e, uid), d("3"));
+    e.on_trade(PERP, d("99.9"), d("10"), Side::Sell, T0, true, T0); // trades through our price
+    assert_eq!(pos_size(&e, uid), d("5"));
+    let o = order(&e, uid, id);
+    assert_eq!(o["status"], "filled");
+    assert_eq!(d(o["fee"].as_str().unwrap()), d("0.1")); // maker fee: 0.02% of 500
+    assert_eq!(e.fut[&uid].locked, Decimal::ZERO);
+    audit(&e);
+}
+
+#[test]
+fn funding_is_paid_by_longs_to_shorts_once_per_period() {
+    let (mut e, alice) = fut_setup();
+    let bob = new_trader(&mut e, "bob", "10000");
+    e.set_fut_settings(bob, PERP, MarginMode::Cross, d("10")).unwrap();
+    go(&mut e, alice, preq(Side::Buy, OType::Market, "10", None));
+    go(&mut e, bob, preq(Side::Sell, OType::Market, "10", None));
+    let bob_wallet = wallet(&e, bob);
+    e.on_perp_ticker(PERP, Some(d("100")), None, Some(d("0.001")), Some(T0 + 1000), None, Ticker::default());
+    e.fut_tick(T0 + 500); // not due yet
+    assert_eq!(e.positions[&(alice, PERP.to_string())].margin, d("100.1"));
+    e.fut_tick(T0 + 1000);
+    e.fut_tick(T0 + 2000); // the same period is never paid twice
+    let a = &e.positions[&(alice, PERP.to_string())];
+    assert_eq!((a.margin, a.funding), (d("99.1"), d("-1"))); // isolated: out of the position's margin
+    assert_eq!(wallet(&e, bob), bob_wallet + d("1")); // cross: into the wallet
+    assert_eq!(e.funding_history(alice, 10)[0]["amount"], "-1");
+    audit(&e);
+}
+
+#[test]
+fn isolated_liquidation_takes_the_whole_margin() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    let before = wallet(&e, uid); // 9899.3995 after margin and fee
+    perp_book(&mut e, "91.0", "91.1");
+    perp_mark(&mut e, "91"); // equity 9.1 > maintenance 4.55: safe
+    e.fut_tick(T0 + 100);
+    assert_eq!(pos_size(&e, uid), d("10"));
+    perp_book(&mut e, "90.5", "90.6");
+    perp_mark(&mut e, "90.5"); // equity 4.1 <= maintenance 4.525
+    e.fut_tick(T0 + 200);
+    assert!(e.positions.is_empty());
+    // what was left of the margin went on the fee and the liquidation fee: back where it started
+    assert_eq!(wallet(&e, uid), before);
+    assert_eq!(e.position_history(uid, 1)[0]["reason"], "liquidated");
+    let r = e.reconcile();
+    assert_eq!(r["insurance_fund"]["USD"], "3.6475");
+    audit(&e);
+}
+
+#[test]
+fn cross_liquidation_and_bankruptcy_hit_the_insurance_fund() {
+    let (mut e, _) = fut_setup();
+    // carol: 300 in futures, 50 long at 20x cross (initial margin 250.25)
+    let carol = new_trader(&mut e, "carol", "300");
+    e.set_fut_settings(carol, PERP, MarginMode::Cross, d("20")).unwrap();
+    go(&mut e, carol, preq(Side::Buy, OType::Market, "50", None));
+    assert_eq!(wallet(&e, carol), d("297.4975"));
+    let liq = e.liq_price(&e.positions[&(carol, PERP.to_string())]).unwrap();
+    assert_eq!(liq.round_dp(4), d("94.6232"));
+    perp_book(&mut e, "94.5", "94.6");
+    perp_mark(&mut e, "94.5");
+    e.fut_tick(T0 + 100);
+    assert_eq!(pos_size(&e, carol), Decimal::ZERO);
+    assert_eq!(wallet(&e, carol), Decimal::ZERO); // the liquidation fee took what was left
+    audit(&e);
+
+    // dave gaps through bankruptcy: his loss is larger than his wallet
+    perp_book(&mut e, "100.0", "100.1");
+    perp_mark(&mut e, "100");
+    let dave = new_trader(&mut e, "dave", "300");
+    e.set_fut_settings(dave, PERP, MarginMode::Cross, d("20")).unwrap();
+    go(&mut e, dave, preq(Side::Buy, OType::Market, "50", None));
+    perp_book(&mut e, "90.0", "90.1");
+    perp_mark(&mut e, "90");
+    e.fut_tick(T0 + 200);
+    assert_eq!(pos_size(&e, dave), Decimal::ZERO);
+    assert_eq!(wallet(&e, dave), Decimal::ZERO); // topped up from the insurance fund, never negative
+    audit(&e);
+}
+
+#[test]
+fn new_season_settles_positions_and_empties_futures_wallets() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    let o = e.place_order(uid, preq(Side::Buy, OType::Limit, "1", Some("95.0")), T0).unwrap();
+    e.activate(o.id, T0);
+    perp_mark(&mut e, "105");
+    e.new_season("S2", T0);
+    assert!(e.positions.is_empty());
+    assert_eq!(wallet(&e, uid), Decimal::ZERO);
+    assert_eq!(e.fut[&uid].locked, Decimal::ZERO);
+    assert_eq!(bal(&e, uid, "USD"), (d("100000"), Decimal::ZERO));
+    audit(&e);
+}
+
+#[test]
+fn kraken_futures_messages_drive_the_engine() {
+    let (mut e, _) = setup();
+    let instruments = r#"{"result":"success","instruments":[{"symbol":"PF_XBTUSD","tickSize":1,"contractValueTradePrecision":4,
+      "tradeable":true,"suspended":false,"maxPositionSize":1200.0,
+      "marginLevels":[{"numNonContractUnits":0.0,"initialMargin":0.02,"maintenanceMargin":0.01}],
+      "retailMarginLevels":[{"numNonContractUnits":0.0,"initialMargin":0.01,"maintenanceMargin":0.005},
+                            {"numNonContractUnits":1000000.0,"initialMargin":0.02,"maintenanceMargin":0.01}]}]}"#;
+    assert_eq!(apply_instruments(&mut e, &serde_json::from_str(instruments).unwrap()), 1);
+    let i = &e.instruments[PERP];
+    assert_eq!((i.price_increment, i.qty_increment, i.kind), (d("1"), d("0.0001"), "perp"));
+    assert_eq!(e.perps[PERP].max_leverage(), d("100"));
+
+    let mut seqs = std::collections::HashMap::new();
+    e.fut_feed_up(T0);
+    let snap = r#"{"feed":"book_snapshot","product_id":"PF_XBTUSD","seq":10,"bids":[{"price":81505.0,"qty":0.5}],
+      "asks":[{"price":81506.0,"qty":0.3}]}"#;
+    handle_fut_message(&mut e, snap, T0, &mut seqs).unwrap();
+    let upd = r#"{"feed":"book","product_id":"PF_XBTUSD","side":"buy","seq":11,"price":81505.5,"qty":1.0}"#;
+    handle_fut_message(&mut e, upd, T0, &mut seqs).unwrap();
+    assert_eq!(e.books[PERP].best(Side::Buy), Some((d("81505.5"), d("1"))));
+    let tick = r#"{"feed":"ticker","product_id":"PF_XBTUSD","markPrice":81505.1477,"index":81495.11,
+      "relative_funding_rate":2.42436625e-05,"next_funding_rate_time":1792184400000,"last":81507.0,"change":-0.98}"#;
+    handle_fut_message(&mut e, tick, T0, &mut seqs).unwrap();
+    let p = &e.perps[PERP];
+    assert_eq!((p.mark, p.funding_rate, p.next_funding_ms), (Some(d("81505.1477")), Some(d("0.0000242436625")), Some(1792184400000)));
+    let trade = r#"{"feed":"trade","product_id":"PF_XBTUSD","side":"sell","type":"fill","time":1792182432209,"qty":0.0001,"price":81505.0}"#;
+    handle_fut_message(&mut e, trade, T0, &mut seqs).unwrap();
+    assert_eq!(e.tickers[PERP].last, Some(d("81505")));
+    assert!(e.tradable(PERP, T0));
+    // a skipped sequence number means a lost update: resync
+    let gap = r#"{"feed":"book","product_id":"PF_XBTUSD","side":"sell","seq":13,"price":81507.0,"qty":1.0}"#;
+    assert!(handle_fut_message(&mut e, gap, T0, &mut seqs).is_err());
 }

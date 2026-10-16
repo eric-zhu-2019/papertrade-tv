@@ -2,6 +2,8 @@
 
 真实行情（Kraken 公开数据）加虚拟资金。学生的订单不会发到任何真实交易所，而是在本服务器内对着 Kraken 的实时订单簿和成交流模拟撮合。不需要任何交易所账户或 API 密钥。
 
+两类市场：8 个现货交易对（BTC/USD 等），以及对应的 8 个永续合约（BTC-PERP 等，行情来自 Kraken Futures），合约可以做空、加杠杆，有资金费率和强平。
+
 后端是 Rust（axum + tokio + SQLite），前端是无构建步骤的静态页面。整体是一个二进制文件加一个 `web/` 目录。
 
 ## 启动
@@ -64,9 +66,27 @@ docker compose exec papertrade sh -c 'cat /data/papertrade.db' > backup.db
 
 **模拟的固有局限**：学生的单子不会真的推动市场价格，也没有真实的对手方排在他们后面。初始资金 10 万美元、交易主流币种时，这个误差很小；资金量设得越大、币种越冷门，结果越偏乐观。
 
+## 永续合约
+
+合约对着 Kraken Futures 的真实永续合约盘口和成交撮合（`PF_XBTUSD` 等，WebSocket v1）。撮合规则和现货相同，只是成交后不交割币，而是开仓、加仓、减仓或反手。
+
+| 项目 | 规则 |
+|---|---|
+| 合约 | 1 张 = 1 个币，USD 结算；每个市场一个净持仓（单向持仓），反向下单先减仓，多出的部分反手 |
+| 资金账户 | 单独的合约钱包，从现货划转 USD 进来才能开仓；未实现盈利要平仓后才能转出 |
+| 杠杆 | 跟 Kraken 一致：BTC、ETH、SOL 最高 100 倍，其他 50 倍；仓位越大，Kraken 的保证金档位要求越高，可用杠杆随之降低 |
+| 保证金 | 逐仓（每个仓位单独的保证金，最多亏掉这部分）或全仓（合约钱包里的钱共同担保所有全仓仓位），按市场设置；有仓位或挂单时不能改 |
+| 手续费 | Kraken Futures 入门费率：挂单 0.02%，吃单 0.05% |
+| 标记价格 | 用 Kraken 的 mark price 计算浮动盈亏、保证金和强平 |
+| 资金费率 | 每小时按 Kraken 当期费率结算：费率为正时多头付给空头，为负时反过来；逐仓从仓位保证金里扣，全仓从钱包里扣 |
+| 强平 | 权益跌到维持保证金以下时，按真实盘口市价平仓，并按仓位价值收 0.5% 清算费（`LIQ_FEE`，我们自己定的，未核实 Kraken 的费率）进保险基金；亏损超过保证金的部分由保险基金承担，账户不会变成负数 |
+| 只减仓 | `reduce_only` 订单只能减少或平掉仓位 |
+
+合约行情断开时暂停合约下单、撮合和强平，现货不受影响。`FUTURES=0` 可以关掉合约。新赛季时所有仓位按标记价格结算，合约钱包清零。
+
 ## 账本
 
-所有余额变动都写入复式账本（`ledger` 表）。每笔成交、手续费、资金发放和赛季重置都是一组合计为零的分录。管理页的「账本对账」检查三件事：各资产总和为零，每个余额等于其流水之和，冻结金额等于未完成订单的占用。
+所有余额变动都写入复式账本（`ledger` 表）。每笔成交、手续费、资金发放和赛季重置都是一组合计为零的分录。合约另有合约钱包（`fut:用户`）、逐仓保证金（`posm:仓位`）、资金费（`funding`）和保险基金（`insurance`）账户。管理页的「账本对账」检查：各资产总和为零，每个余额等于其流水之和，冻结金额等于未完成订单的占用，每个逐仓仓位的保证金等于其流水。
 
 ## 排行榜和赛季
 
@@ -76,7 +96,7 @@ docker compose exec papertrade sh -c 'cat /data/papertrade.db' > backup.db
 
 ## API（给写机器人的学生）
 
-在「账户」页创建 API 密钥，所有请求带 `Authorization: Bearer <key>`。订单字段命名参照 Kraken（`limit_price`、`trigger_price`、`time_in_force`、`post_only`），鉴权方式简化为 Bearer 令牌。完整示例在「账户 → API 快速上手」。
+在「账户」页创建 API 密钥，所有请求带 `Authorization: Bearer <key>`。合约下单用同一个 `POST /api/orders`，`symbol` 填 `BTC-PERP`，可加 `reduce_only`；合约账户、划转、杠杆设置、一键平仓、仓位历史和资金费记录在 `/api/futures/*`。订单字段命名参照 Kraken（`limit_price`、`trigger_price`、`time_in_force`、`post_only`），鉴权方式简化为 Bearer 令牌。完整示例在「账户 → API 快速上手」。
 
 | 接口 | 用途 |
 |---|---|
@@ -99,13 +119,15 @@ FEED=sim ADMIN_PASSWORD=adminpass123 INVITE_CODE=test cargo run
 ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # 对运行中的实例做端到端检查
 ```
 
-`smoke_test.py` 只用 Python 标准库，约 3 秒跑完 27 项检查：行情、WebSocket、各类订单与冻结资金、账号隔离、权限、一次性邀请码、API 密钥、账本对账。只需要 `ADMIN_PASSWORD`。它使用专用账号 `smoke-a` / `smoke-b` / `smoke-c`（首次运行时用自己生成的一次性邀请码注册），结束时卖回持仓并禁用这些账号，所以不会出现在排行榜上。`deploy.sh` 部署完会在服务器上自动运行它（`SMOKE=0 ./deploy.sh` 跳过）。
+`smoke_test.py` 只用 Python 标准库，约 5 秒跑完 35 项检查：行情、WebSocket、各类订单与冻结资金、合约（划转、杠杆、逐仓开多、全仓做空、只减仓、平仓）、账号隔离、权限、一次性邀请码、API 密钥、账本对账。只需要 `ADMIN_PASSWORD`。它使用专用账号 `smoke-a` / `smoke-b` / `smoke-c`（首次运行时用自己生成的一次性邀请码注册），结束时卖回持仓并禁用这些账号，所以不会出现在排行榜上。`deploy.sh` 部署完会在服务器上自动运行它（`SMOKE=0 ./deploy.sh` 跳过）。
 
 | 文件 | 内容 |
 |---|---|
 | `src/engine.rs` | 撮合模拟与账本 |
 | `src/book.rs` | 订单簿镜像、已消耗流动性、校验和 |
-| `src/feed.rs` | Kraken 行情接入、模拟行情 |
+| `src/feed.rs` | Kraken 现货行情接入、模拟行情（含合约） |
+| `src/kfeed.rs` | Kraken Futures 行情接入、合约规则、合约 K 线 |
+| `src/futures.rs` | 合约：钱包、仓位、保证金、资金费、强平 |
 | `src/api.rs` | REST 和 WebSocket 接口 |
 | `src/accounts.rs` | 用户、会话、API 密钥、一次性邀请码 |
 | `src/candles.rs` | K 线 |

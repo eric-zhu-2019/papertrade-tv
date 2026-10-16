@@ -13,6 +13,7 @@
 use crate::book::{Book, Level, Side};
 use crate::candles::CandleStore;
 use crate::config::Config;
+use crate::futures::{FutAcct, MarginMode, Perp, Position};
 use crate::util::*;
 use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
@@ -136,6 +137,8 @@ pub struct Order {
     pub otype: OType,
     pub tif: Tif,
     pub post_only: bool,
+    /// Perps only: may shrink or close the position but never open or grow one.
+    pub reduce_only: bool,
     pub qty: Decimal,
     pub limit_price: Option<Decimal>,
     pub trigger_price: Option<Decimal>,
@@ -143,7 +146,8 @@ pub struct Order {
     pub cum_cost: Decimal,
     pub fee: Decimal,
     pub status: Status,
-    /// Funds still reserved for this order (quote for buys, base for sells).
+    /// Funds still reserved for this order (spot: quote for buys, base for sells;
+    /// perps: USD in the futures wallet for initial margin and fees).
     pub locked: Decimal,
     /// Real-exchange quantity still ahead of this order at its price level.
     pub queue_ahead: Option<Decimal>,
@@ -178,12 +182,15 @@ pub struct OrderReq {
     pub trigger_price: Option<Decimal>,
     pub tif: Tif,
     pub post_only: bool,
+    pub reduce_only: bool,
     pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Instrument {
     pub symbol: String,
+    /// "spot" or "perp"
+    pub kind: &'static str,
     pub base: String,
     pub quote: String,
     pub price_increment: Decimal,
@@ -244,6 +251,15 @@ pub struct Engine {
     in_tx: bool,
     book_pub_ms: HashMap<String, i64>,
     rate: HashMap<i64, (f64, i64)>,
+    // perpetual futures (see futures.rs)
+    pub perps: HashMap<String, Perp>,
+    pub fut: HashMap<i64, FutAcct>,
+    /// Open positions by (user, symbol).
+    pub positions: HashMap<(i64, String), Position>,
+    pub(crate) fut_prefs: HashMap<(i64, String), (MarginMode, Decimal)>,
+    pub fut_feed_connected: bool,
+    pub fut_last_feed_ms: i64,
+    pub(crate) funding_done: HashMap<String, i64>,
 }
 
 const SCHEMA: &str = "
@@ -287,6 +303,20 @@ CREATE TABLE IF NOT EXISTS user_stats(
   user_id INTEGER, season_id INTEGER, peak TEXT, max_dd REAL, PRIMARY KEY(user_id, season_id));
 CREATE TABLE IF NOT EXISTS invites(
   code TEXT PRIMARY KEY, note TEXT, created_ms INTEGER NOT NULL, used_by INTEGER, used_ms INTEGER);
+CREATE TABLE IF NOT EXISTS fut_accounts(user_id INTEGER PRIMARY KEY, wallet TEXT NOT NULL, locked TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fut_settings(
+  user_id INTEGER, symbol TEXT, mode TEXT NOT NULL, leverage TEXT NOT NULL, PRIMARY KEY(user_id, symbol));
+CREATE TABLE IF NOT EXISTS positions(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, season_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+  size TEXT NOT NULL, entry TEXT NOT NULL, mode TEXT NOT NULL, leverage TEXT NOT NULL, margin TEXT NOT NULL,
+  realized TEXT NOT NULL, fees TEXT NOT NULL, funding TEXT NOT NULL, closed_qty TEXT NOT NULL, closed_value TEXT NOT NULL,
+  opened_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, closed_ms INTEGER, close_reason TEXT);
+CREATE INDEX IF NOT EXISTS positions_user ON positions(user_id, season_id, id);
+CREATE TABLE IF NOT EXISTS funding(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, position_id INTEGER NOT NULL, season_id INTEGER NOT NULL,
+  symbol TEXT NOT NULL, ts_ms INTEGER NOT NULL, rate TEXT NOT NULL, mark TEXT NOT NULL, amount TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS funding_user ON funding(user_id, season_id, id);
+CREATE TABLE IF NOT EXISTS funding_runs(symbol TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL);
 ";
 
 fn sdec(s: String) -> Decimal {
@@ -306,13 +336,25 @@ impl Engine {
         }
         let db = Connection::open(path).expect("open database");
         db.execute_batch(SCHEMA).expect("create schema");
+        // columns added after the first release
+        let has_reduce_only: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('orders') WHERE name='reduce_only'")
+            .and_then(|mut st| st.exists([]))
+            .unwrap_or(false);
+        if !has_reduce_only {
+            db.execute_batch("ALTER TABLE orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0").expect("migrate orders");
+        }
         let mut e = Engine {
             cfg: cfg.clone(),
             db,
             tx,
             instruments: HashMap::new(),
-            books: cfg.symbols.iter().map(|s| (s.clone(), Book::new(cfg.book_depth))).collect(),
-            tickers: cfg.symbols.iter().map(|s| (s.clone(), Ticker::default())).collect(),
+            // Kraken Futures sends the whole book and no "level left your depth" deletions, so perp books keep every level
+            books: cfg
+                .markets()
+                .map(|s| (s.clone(), Book::new(if cfg.is_perp(s) { usize::MAX } else { cfg.book_depth })))
+                .collect(),
+            tickers: cfg.markets().map(|s| (s.clone(), Ticker::default())).collect(),
             tape: HashMap::new(),
             candles: CandleStore::default(),
             balances: HashMap::new(),
@@ -328,6 +370,13 @@ impl Engine {
             in_tx: false,
             book_pub_ms: HashMap::new(),
             rate: HashMap::new(),
+            perps: cfg.perps.iter().map(|s| (s.clone(), Perp::new(s))).collect(),
+            fut: HashMap::new(),
+            positions: HashMap::new(),
+            fut_prefs: HashMap::new(),
+            fut_feed_connected: false,
+            fut_last_feed_ms: 0,
+            funding_done: HashMap::new(),
         };
         e.load();
         e
@@ -377,6 +426,7 @@ impl Engine {
                 self.balances.insert((u, a), Bal { total: sdec(t), locked: sdec(l) });
             }
         }
+        self.fut_load();
         // stats
         {
             let mut st =
@@ -416,7 +466,7 @@ impl Engine {
 
     // ---------------------------------------------------------------- db helpers
 
-    fn ensure_tx(&mut self) {
+    pub(crate) fn ensure_tx(&mut self) {
         if !self.in_tx {
             self.db.execute_batch("BEGIN").expect("begin");
             self.in_tx = true;
@@ -430,7 +480,7 @@ impl Engine {
         }
     }
 
-    fn save_bal(&mut self, uid: i64, asset: &str) {
+    pub(crate) fn save_bal(&mut self, uid: i64, asset: &str) {
         self.ensure_tx();
         let b = self.balances.get(&(uid, asset.to_string())).cloned().unwrap_or_default();
         self.db
@@ -442,7 +492,7 @@ impl Engine {
             .expect("save balance");
     }
 
-    fn save_order(&mut self, o: &Order) {
+    pub(crate) fn save_order(&mut self, o: &Order) {
         self.ensure_tx();
         self.db
             .execute(
@@ -461,13 +511,13 @@ impl Engine {
             .expect("save order");
     }
 
-    fn new_txn(&mut self) -> i64 {
+    pub(crate) fn new_txn(&mut self) -> i64 {
         let t = self.next_txn;
         self.next_txn += 1;
         t
     }
 
-    fn ledger(&mut self, txn: i64, ts: i64, account: &str, asset: &str, amount: Decimal, kind: &str, rf: i64) {
+    pub(crate) fn ledger(&mut self, txn: i64, ts: i64, account: &str, asset: &str, amount: Decimal, kind: &str, rf: i64) {
         if amount.is_zero() {
             return;
         }
@@ -481,16 +531,16 @@ impl Engine {
     }
 
     /// Balanced two-line journal entry: `amount` of `asset` moves from one account to another.
-    fn transfer(&mut self, txn: i64, ts: i64, from: &str, to: &str, asset: &str, amount: Decimal, kind: &str, rf: i64) {
+    pub(crate) fn transfer(&mut self, txn: i64, ts: i64, from: &str, to: &str, asset: &str, amount: Decimal, kind: &str, rf: i64) {
         self.ledger(txn, ts, from, asset, -amount, kind, rf);
         self.ledger(txn, ts, to, asset, amount, kind, rf);
     }
 
-    fn publish(&self, ev: Event) {
+    pub(crate) fn publish(&self, ev: Event) {
         let _ = self.tx.send(ev);
     }
 
-    fn emit_order(&self, o: &Order) {
+    pub(crate) fn emit_order(&self, o: &Order) {
         let payload = json!({"type": "order", "order": o.to_json()}).to_string();
         self.publish(Event::User { user_id: o.user_id, payload: payload.into() });
     }
@@ -531,7 +581,7 @@ impl Engine {
                 eq += b.total * p;
             }
         }
-        eq
+        eq + self.fut_equity(uid)
     }
 
     // ---------------------------------------------------------------- market data in
@@ -541,8 +591,8 @@ impl Engine {
     }
 
     pub fn tradable(&self, symbol: &str, now: i64) -> bool {
-        self.feed_ok(now)
-            && self.books.get(symbol).map(|b| b.ready).unwrap_or(false)
+        let feed = if self.perps.contains_key(symbol) { self.fut_feed_ok(now) } else { self.feed_ok(now) };
+        feed && self.books.get(symbol).map(|b| b.ready).unwrap_or(false)
             && self.instruments.get(symbol).map(|i| i.status == "online").unwrap_or(false)
     }
 
@@ -553,8 +603,10 @@ impl Engine {
 
     pub fn feed_down(&mut self) {
         self.feed_connected = false;
-        for b in self.books.values_mut() {
-            b.ready = false;
+        for (s, b) in self.books.iter_mut() {
+            if !self.perps.contains_key(s) {
+                b.ready = false;
+            }
         }
     }
 
@@ -790,7 +842,7 @@ impl Engine {
         if self.orders.values().filter(|o| o.user_id == uid).count() >= cfg.max_open_orders {
             return Err(format!("too many open orders (max {})", cfg.max_open_orders));
         }
-        let note = req.note.map(|n| n.trim().chars().take(500).collect::<String>()).filter(|n| !n.is_empty());
+        let note = req.note.as_ref().map(|n| n.trim().chars().take(500).collect::<String>()).filter(|n| !n.is_empty());
         if cfg.require_note && note.is_none() {
             return Err("a trade note is required: write one sentence on why you are placing this order".into());
         }
@@ -834,62 +886,46 @@ impl Engine {
             return Err(format!("order value is below the minimum of {} {}", inst.cost_min.normalize(), inst.quote));
         }
 
-        // reserve funds
-        let (lock_asset, lock_amt) = match req.side {
-            Side::Sell => (inst.base.clone(), req.qty),
-            Side::Buy => {
-                let amt = match req.otype {
-                    OType::Market => Decimal::ZERO,
-                    _ => ceil8(req.qty * ref_price * (Decimal::ONE + cfg.max_fee())),
-                };
-                (inst.quote.clone(), amt)
-            }
-        };
-        let free = self.free(uid, &lock_asset);
-        let needed = if req.otype == OType::Market && req.side == Side::Buy {
-            // rough pre-check; the real cost is decided when the order walks the book
-            req.qty * ref_price * (Decimal::ONE + cfg.taker_fee)
-        } else {
-            lock_amt
-        };
-        if needed > free {
-            return Err(format!(
-                "insufficient {}: need {}, available {}",
-                lock_asset,
-                needed.round_dp(8).normalize(),
-                free.round_dp(8).normalize()
-            ));
+        let perp = self.perps.contains_key(&req.symbol);
+        if req.reduce_only && !perp {
+            return Err("reduce_only is only for futures".into());
         }
 
+        // reserve funds
+        let (lock_asset, lock_amt) = if perp {
+            (String::new(), self.fut_check_order(uid, &req, ref_price)?)
+        } else {
+            let (lock_asset, lock_amt) = match req.side {
+                Side::Sell => (inst.base.clone(), req.qty),
+                Side::Buy => {
+                    let amt = match req.otype {
+                        OType::Market => Decimal::ZERO,
+                        _ => ceil8(req.qty * ref_price * (Decimal::ONE + cfg.max_fee())),
+                    };
+                    (inst.quote.clone(), amt)
+                }
+            };
+            let free = self.free(uid, &lock_asset);
+            let needed = if req.otype == OType::Market && req.side == Side::Buy {
+                // rough pre-check; the real cost is decided when the order walks the book
+                req.qty * ref_price * (Decimal::ONE + cfg.taker_fee)
+            } else {
+                lock_amt
+            };
+            if needed > free {
+                return Err(format!(
+                    "insufficient {}: need {}, available {}",
+                    lock_asset,
+                    needed.round_dp(8).normalize(),
+                    free.round_dp(8).normalize()
+                ));
+            }
+            (lock_asset, lock_amt)
+        };
+
         let status = if req.otype.is_stop() { Status::Untriggered } else { Status::Pending };
-        self.ensure_tx();
-        self.db
-            .execute(
-                "INSERT INTO orders(user_id, season_id, symbol, side, otype, tif, post_only, qty, limit_price,
-                   trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,'0','0','0',?,?,?,NULL,?,?)",
-                params![
-                    uid,
-                    self.season_id,
-                    req.symbol,
-                    req.side.as_str(),
-                    req.otype.as_str(),
-                    req.tif.as_str(),
-                    req.post_only as i64,
-                    req.qty.to_string(),
-                    limit.map(|x| x.to_string()),
-                    trigger.map(|x| x.to_string()),
-                    status.as_str(),
-                    lock_amt.to_string(),
-                    note,
-                    now,
-                    now
-                ],
-            )
-            .expect("insert order");
-        let id = self.db.last_insert_rowid();
-        let o = Order {
-            id,
+        let o = self.insert_order(Order {
+            id: 0,
             user_id: uid,
             season_id: self.season_id,
             symbol: req.symbol,
@@ -897,6 +933,7 @@ impl Engine {
             otype: req.otype,
             tif: req.tif,
             post_only: req.post_only,
+            reduce_only: req.reduce_only,
             qty: req.qty,
             limit_price: limit,
             trigger_price: trigger,
@@ -910,15 +947,51 @@ impl Engine {
             reason: None,
             created_ms: now,
             updated_ms: now,
-        };
+        });
         if !lock_amt.is_zero() {
-            self.balances.entry((uid, lock_asset.clone())).or_default().locked += lock_amt;
-            self.save_bal(uid, &lock_asset);
+            if perp {
+                self.fut_lock(uid, lock_amt);
+            } else {
+                self.balances.entry((uid, lock_asset.clone())).or_default().locked += lock_amt;
+                self.save_bal(uid, &lock_asset);
+            }
         }
-        self.orders.insert(id, o.clone());
         self.commit();
         self.emit_order(&o);
         Ok(o)
+    }
+
+    /// Store a new live order and give it its id.
+    pub(crate) fn insert_order(&mut self, mut o: Order) -> Order {
+        self.ensure_tx();
+        self.db
+            .execute(
+                "INSERT INTO orders(user_id, season_id, symbol, side, otype, tif, post_only, qty, limit_price,
+                   trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,'0','0','0',?,?,?,NULL,?,?,?)",
+                params![
+                    o.user_id,
+                    o.season_id,
+                    o.symbol,
+                    o.side.as_str(),
+                    o.otype.as_str(),
+                    o.tif.as_str(),
+                    o.post_only as i64,
+                    o.qty.to_string(),
+                    o.limit_price.map(|x| x.to_string()),
+                    o.trigger_price.map(|x| x.to_string()),
+                    o.status.as_str(),
+                    o.locked.to_string(),
+                    o.note,
+                    o.created_ms,
+                    o.updated_ms,
+                    o.reduce_only as i64
+                ],
+            )
+            .expect("insert order");
+        o.id = self.db.last_insert_rowid();
+        self.orders.insert(o.id, o.clone());
+        o
     }
 
     /// The order "arrives at the exchange" after its simulated latency.
@@ -934,6 +1007,10 @@ impl Engine {
         let Some(o) = self.orders.get(&oid).cloned() else { return };
         if !self.tradable(&o.symbol, now) {
             self.finish(oid, Status::Rejected, Some("market data became unavailable before the order reached the book"), now);
+            return;
+        }
+        if o.reduce_only && self.fut_closable(o.user_id, &o.symbol, o.side).is_zero() {
+            self.finish(oid, Status::Canceled, Some("reduce-only: there is no position left to reduce"), now);
             return;
         }
         let opp = o.side.opposite();
@@ -984,13 +1061,14 @@ impl Engine {
     }
 
     /// Walk the opposite side of the real book.
-    fn take(&mut self, oid: i64, limit: Option<Decimal>, now: i64) {
+    pub(crate) fn take(&mut self, oid: i64, limit: Option<Decimal>, now: i64) {
         let cfg = self.cfg.clone();
         let (uid, symbol, side) = {
             let o = &self.orders[&oid];
             (o.user_id, o.symbol.clone(), o.side)
         };
         let inst = self.instruments[&symbol].clone();
+        let perp = self.perps.contains_key(&symbol);
         let opp = side.opposite();
         let levels = self.books[&symbol].avail_levels(opp, now);
         for (p, avail) in levels {
@@ -1005,7 +1083,9 @@ impl Engine {
                 }
             }
             let mut f = o.remaining().min(avail);
-            if side == Side::Buy {
+            if perp {
+                f = f.min(self.fut_max_fill(oid, p));
+            } else if side == Side::Buy {
                 let funds = self.free(uid, &inst.quote) + o.locked;
                 let unit = p * (Decimal::ONE + cfg.taker_fee);
                 let affordable = floor_to((funds - d("0.00000002")).max(Decimal::ZERO) / unit, inst.qty_increment);
@@ -1026,6 +1106,9 @@ impl Engine {
             let o = &self.orders[&oid];
             (o.user_id, o.symbol.clone(), o.side)
         };
+        if self.perps.contains_key(&symbol) {
+            return self.fut_apply_fill(oid, price, qty, taker, now);
+        }
         let inst = self.instruments[&symbol].clone();
         let cost = round8(price * qty);
         let mut fee = round8(cost * if taker { cfg.taker_fee } else { cfg.maker_fee });
@@ -1079,28 +1162,7 @@ impl Engine {
             o.status = Status::Filled;
         }
         let snap = o.clone();
-
-        self.ensure_tx();
-        self.db
-            .execute(
-                "INSERT INTO fills(order_id, user_id, season_id, symbol, side, price, qty, cost, fee, liquidity, ts_ms)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                params![
-                    oid,
-                    uid,
-                    snap.season_id,
-                    symbol,
-                    side.as_str(),
-                    price.to_string(),
-                    qty.to_string(),
-                    cost.to_string(),
-                    fee.to_string(),
-                    if taker { "taker" } else { "maker" },
-                    now
-                ],
-            )
-            .expect("insert fill");
-        let fid = self.db.last_insert_rowid();
+        let fid = self.record_fill(&snap, price, qty, cost, fee, taker, now);
         let txn = self.new_txn();
         let user = format!("user:{uid}");
         match side {
@@ -1120,20 +1182,54 @@ impl Engine {
         if done {
             self.orders.remove(&oid);
         }
+        self.publish_fill(&snap, fid, price, qty, cost, fee, taker, now);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_fill(&mut self, o: &Order, price: Decimal, qty: Decimal, cost: Decimal, fee: Decimal, taker: bool, now: i64) -> i64 {
+        self.ensure_tx();
+        self.db
+            .execute(
+                "INSERT INTO fills(order_id, user_id, season_id, symbol, side, price, qty, cost, fee, liquidity, ts_ms)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    o.id,
+                    o.user_id,
+                    o.season_id,
+                    o.symbol,
+                    o.side.as_str(),
+                    price.to_string(),
+                    qty.to_string(),
+                    cost.to_string(),
+                    fee.to_string(),
+                    if taker { "taker" } else { "maker" },
+                    now
+                ],
+            )
+            .expect("insert fill");
+        self.db.last_insert_rowid()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_fill(&self, o: &Order, fid: i64, price: Decimal, qty: Decimal, cost: Decimal, fee: Decimal, taker: bool, now: i64) {
         let payload = json!({
             "type": "fill",
-            "fill": {"id": fid, "order_id": oid, "symbol": symbol, "side": side.as_str(),
+            "fill": {"id": fid, "order_id": o.id, "symbol": o.symbol, "side": o.side.as_str(),
                      "price": price.to_string(), "qty": qty.to_string(), "cost": cost.to_string(),
                      "fee": fee.to_string(), "liquidity": if taker { "taker" } else { "maker" }, "ts": now},
-            "order": snap.to_json(),
+            "order": o.to_json(),
         })
         .to_string();
-        self.publish(Event::User { user_id: uid, payload: payload.into() });
+        self.publish(Event::User { user_id: o.user_id, payload: payload.into() });
     }
 
     /// Close a live order: release its reservation and take it off the book.
-    fn finish(&mut self, oid: i64, status: Status, reason: Option<&str>, now: i64) {
+    pub(crate) fn finish(&mut self, oid: i64, status: Status, reason: Option<&str>, now: i64) {
         let Some(mut o) = self.orders.remove(&oid) else { return };
+        if !o.locked.is_zero() && self.perps.contains_key(&o.symbol) {
+            self.fut_unlock(o.user_id, o.locked);
+            o.locked = Decimal::ZERO;
+        }
         if !o.locked.is_zero() {
             let (base, quote) = o.symbol.split_once('/').unwrap_or((&o.symbol, &self.cfg.quote));
             let asset = if o.side == Side::Buy { quote.to_string() } else { base.to_string() };
@@ -1282,7 +1378,10 @@ impl Engine {
                 "price": price.map(s), "value": value.map(s), "avg_cost": avg.map(s), "unrealized_pnl": pnl.map(s),
             }));
         }
-        json!({"equity": equity.round_dp(2).to_string(), "assets": assets,
+        // the futures account counts too: wallet + isolated margin + unrealised P&L
+        let futures = self.fut_equity(uid);
+        equity += futures;
+        json!({"equity": equity.round_dp(2).to_string(), "futures_equity": futures.round_dp(2).to_string(), "assets": assets,
                "start_balance": self.cfg.start_balance.normalize().to_string()})
     }
 
@@ -1301,7 +1400,8 @@ impl Engine {
                 "tradable": self.tradable(s, now),
             }));
         }
-        json!({"type": "tickers", "feed_ok": self.feed_ok(now), "ts": now, "tickers": out})
+        out.extend(self.fut_tickers(now));
+        json!({"type": "tickers", "feed_ok": self.feed_ok(now), "fut_feed_ok": self.fut_feed_ok(now), "ts": now, "tickers": out})
     }
 
     // ---------------------------------------------------------------- stats, seasons, audit
@@ -1476,6 +1576,7 @@ impl Engine {
         for id in ids {
             self.finish(id, Status::Canceled, Some("season ended"), now);
         }
+        self.fut_season_reset(now);
         // sweep all balances back to the treasury
         let keys: Vec<(i64, String)> = self.balances.keys().cloned().collect();
         for (uid, asset) in keys {
@@ -1578,6 +1679,7 @@ impl Engine {
                 problems.push(format!("user {uid} {asset}: invalid balance total {} locked {}", b.total, b.locked));
             }
         }
+        self.fut_reconcile(&sums, &mut problems);
         let sys = |name: &str| -> Value {
             let m: serde_json::Map<String, Value> = sums
                 .iter()
@@ -1589,12 +1691,13 @@ impl Engine {
         json!({
             "ok": problems.is_empty(), "problems": problems, "ledger_lines": lines,
             "fees_collected": sys("fees"), "market": sys("market"), "treasury": sys("treasury"),
+            "insurance_fund": sys("insurance"), "funding": sys("funding"),
         })
     }
 }
 
 const ORDER_COLS: &str = "id, user_id, season_id, symbol, side, otype, tif, post_only, qty, limit_price, \
-     trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms";
+     trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only";
 
 fn row_to_order(r: &rusqlite::Row) -> rusqlite::Result<Order> {
     Ok(Order {
@@ -1619,5 +1722,6 @@ fn row_to_order(r: &rusqlite::Row) -> rusqlite::Result<Order> {
         reason: r.get(17)?,
         created_ms: r.get(18)?,
         updated_ms: r.get(19)?,
+        reduce_only: r.get::<_, i64>(20)? != 0,
     })
 }
