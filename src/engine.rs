@@ -262,6 +262,8 @@ pub struct Engine {
     pub(crate) funding_done: HashMap<String, i64>,
     /// Funding periods that ended, captured from tickers: (symbol, time, rate).
     pub(crate) funding_due: Vec<(String, i64, Decimal)>,
+    /// Set while the engine itself is closing a position for liquidation.
+    pub(crate) liquidating: bool,
 }
 
 const SCHEMA: &str = "
@@ -380,6 +382,7 @@ impl Engine {
             fut_last_feed_ms: 0,
             funding_done: HashMap::new(),
             funding_due: Vec::new(),
+            liquidating: false,
         };
         e.load();
         e

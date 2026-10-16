@@ -536,9 +536,10 @@ impl Engine {
     pub(crate) fn fut_apply_fill(&mut self, oid: i64, price: Decimal, qty: Decimal, taker: bool, now: i64) {
         let cfg = self.cfg.clone();
         let quote = cfg.quote.clone();
-        let (uid, symbol, side, reduce_only, liquidation) = {
+        let liquidation = self.liquidating;
+        let (uid, symbol, side, reduce_only) = {
             let o = &self.orders[&oid];
-            (o.user_id, o.symbol.clone(), o.side, o.reduce_only, o.note.as_deref() == Some("liquidation"))
+            (o.user_id, o.symbol.clone(), o.side, o.reduce_only)
         };
         let closable = self.fut_closable(uid, &symbol, side);
         let qty = if reduce_only { qty.min(closable) } else { qty };
@@ -571,13 +572,22 @@ impl Engine {
             rest -= c;
             self.transfer(txn, now, &format!("posm:{}", p.id), &wallet_acct, &quote, release, "margin", p.id);
             self.pnl_entry(txn, now, &wallet_acct, pnl, p.id);
-            wallet_delta += release + pnl;
-            if p.mode == MarginMode::Isolated && release + pnl < Decimal::ZERO {
-                // an isolated position can lose at most its margin; the insurance fund takes the rest
-                let cover = -(release + pnl);
-                self.transfer(txn, now, "insurance", &wallet_acct, &quote, cover, "insurance", p.id);
-                wallet_delta += cover;
+            let mut net = release + pnl;
+            if p.mode == MarginMode::Isolated && net < Decimal::ZERO {
+                // a loss bigger than the margin released for this part comes out of the margin the
+                // rest of the position still holds; only past that does the insurance fund pay
+                let more = (-net).min(p.margin);
+                if more > Decimal::ZERO {
+                    self.transfer(txn, now, &format!("posm:{}", p.id), &wallet_acct, &quote, more, "margin", p.id);
+                    p.margin -= more;
+                    net += more;
+                }
+                if net < Decimal::ZERO {
+                    self.transfer(txn, now, "insurance", &wallet_acct, &quote, -net, "insurance", p.id);
+                    net = Decimal::ZERO;
+                }
             }
+            wallet_delta += net;
         }
         let mut closed = None;
         if pos.as_ref().map(|p| p.size.is_zero()).unwrap_or(false) {
@@ -862,7 +872,9 @@ impl Engine {
             created_ms: now,
             updated_ms: now,
         });
+        self.liquidating = true;
         self.take(o.id, None, now);
+        self.liquidating = false;
         if self.orders.contains_key(&o.id) {
             self.finish(o.id, Status::Canceled, Some("liquidation: the book was too thin; retrying"), now);
         }

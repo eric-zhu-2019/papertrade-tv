@@ -749,3 +749,20 @@ fn funding_is_not_missed_when_the_ticker_rolls_over_first() {
     assert_eq!(e.positions[&(alice, PERP.to_string())].funding, d("-1"));
     audit(&e);
 }
+
+#[test]
+fn partial_close_loss_comes_from_the_rest_of_the_margin_first() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None)); // 10 @ 100.1, margin 100.1 at 10x
+    // a gap far below the entry, before any liquidation check ran: close half at 85
+    perp_book(&mut e, "85.0", "85.1");
+    go(&mut e, uid, OrderReq { reduce_only: true, ..preq(Side::Sell, OType::Market, "5", None) });
+    // loss 5 * 15.1 = 75.5; 50.05 of margin released, the other 25.45 taken from the remaining margin
+    let p = &e.positions[&(uid, PERP.to_string())];
+    assert_eq!((p.size, p.margin), (d("5"), d("100.1") - d("50.05") - d("25.45")));
+    assert!(e.reconcile()["insurance_fund"].get("USD").is_none()); // the insurance fund was not touched
+    // a student's own order with the note "liquidation" is still an ordinary close
+    go(&mut e, uid, OrderReq { reduce_only: true, note: Some("liquidation".into()), ..preq(Side::Sell, OType::Market, "5", None) });
+    assert_eq!(e.position_history(uid, 1)[0]["reason"], "closed");
+    audit(&e);
+}
