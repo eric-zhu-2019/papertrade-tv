@@ -365,7 +365,7 @@ function updateForm() {
   if (perp) {
     const st = futSettings(sym);
     if (document.activeElement !== form.margin_mode) form.margin_mode.value = st.margin_mode;
-    const locked = !!position(sym);
+    const locked = !!position(sym) || (S.orders || []).some((o) => o.symbol === sym);
     form.margin_mode.disabled = locked;
     form.margin_mode.title = locked ? t("mode_locked") : "";
     if (document.activeElement !== form.leverage) form.leverage.value = st.leverage;
@@ -457,46 +457,52 @@ form.addEventListener("submit", async (e) => {
 });
 
 // ---------------------------------------------------------------- futures account
-/// Liquidation price of an isolated position with margin `m` (same formula as the server).
+/// Liquidation price of an isolated position holding margin `m` (the server's formula, for the
+/// add/remove-margin preview; leverage changes are previewed by the server itself).
 function isoLiq(p, m) {
-  const q = +p.size, e = +p.entry, mm = +p.value > 0 ? +p.maint_margin / +p.value : 0;
+  const q = +p.size, e = +p.entry, mm = +p.maint_rate;
   const l = p.side === "long" ? (q * e - m) / (q * (1 - mm)) : (q * e + m) / (q * (1 + mm));
   return l > 0 ? l : null;
 }
 async function saveFutSettings() {
+  clearTimeout(levTimer);
   const err = $("#order-err"); err.textContent = "";
   const sym = S.symbol, mode = form.margin_mode.value, lev = Math.round(+form.leverage.value);
+  const body = { symbol: sym, margin_mode: mode, leverage: lev };
   const send = async () => {
-    S.fut = await api("/futures/settings", { method: "POST", body: { symbol: sym, margin_mode: mode, leverage: lev } });
+    S.fut = await api("/futures/settings", { method: "POST", body });
     toast(`${sym}: ${t(mode)} ${lev}x`);
     refreshSoon();
   };
   form.margin_mode.blur(); form.leverage.blur();
   const p = position(sym), old = +futSettings(sym).leverage;
   if (p && lev !== old && lev >= 1) {
-    // a position changes with the leverage: show what will happen before doing it
-    const value = +p.size * +p.entry;
-    let html, preview;
-    if (p.margin_mode === "isolated") {
-      const m = value / lev, diff = m - +p.margin, liq = isoLiq(p, m);
-      html = `<p class="muted small">${esc(t("lev_iso_hint"))}</p>`;
-      preview = () => `${esc(t("cur_margin"))} <b>$${fmtUsd(p.margin)}</b> → <b>$${fmtUsd(m)}</b> (${diff >= 0 ? esc(t("lev_refill")) : esc(t("lev_release"))} $${fmtUsd(Math.abs(diff))})<br>` +
-        `${esc(t("liq_price"))} <b>${fmtPrice(sym, p.liq_price)}</b> → <b class="down">${liq ? fmtPrice(sym, liq) : "–"}</b>`;
-    } else {
-      html = `<p class="muted small">${esc(t("lev_cross_hint"))}</p>`;
-      preview = () => `${esc(t("margin_tied"))} <b>$${fmtUsd(value / old)}</b> → <b>$${fmtUsd(value / lev)}</b>`;
-    }
-    openModal({ title: `${t("change_lev")} · ${sym} · ${old}x → ${lev}x`, html, preview, ok: send, onCancel: updateForm });
+    // the position changes with the leverage: show what the server will do before doing it
+    let plan;
+    try { plan = await api("/futures/settings", { method: "POST", body: { ...body, dry_run: true } }); }
+    catch (ex) { err.textContent = ex.message; updateForm(); return; }
+    const iso = p.margin_mode === "isolated", diff = +plan.margin_after - +plan.margin_before;
+    const moved = iso && Math.abs(diff) >= 0.005 ? ` (${esc(t(diff > 0 ? "lev_refill" : "lev_release"))} $${fmtUsd(Math.abs(diff))})` : "";
+    const locks = Math.abs(+plan.orders_lock_delta) >= 0.005 ? `<br>${esc(t("orders_lock"))} <b>${signUsd(plan.orders_lock_delta)}</b>` : "";
+    const html = `<p class="muted small">${esc(t(iso ? "lev_iso_hint" : "lev_cross_hint"))}</p>` +
+      `<p class="small">${esc(t(iso ? "cur_margin" : "margin_used"))} <b>$${fmtUsd(plan.margin_before)}</b> → <b>$${fmtUsd(plan.margin_after)}</b>${moved}<br>` +
+      `${esc(t("liq_price"))} <b>${plan.liq_before ? fmtPrice(sym, plan.liq_before) : "–"}</b> → <b class="down">${plan.liq_after ? fmtPrice(sym, plan.liq_after) : "–"}</b>${locks}</p>`;
+    openModal({ title: `${t("change_lev")} · ${sym} · ${old}x → ${lev}x`, html, ok: send, onCancel: updateForm });
     return;
   }
   try { await send(); } catch (ex) { err.textContent = ex.message; }
   updateForm();
 }
+// spinner clicks fire "change" each time: wait until the value settles before applying it
+let levTimer = null;
+function queueFutSettings() { clearTimeout(levTimer); levTimer = setTimeout(saveFutSettings, 600); }
 
 // ---------------------------------------------------------------- modal
-const M = {};
+const M = { seq: 0, busy: false };
 function openModal({ title, html = "", input = false, max = null, preview = null, ok, okLabel, onCancel = null }) {
-  Object.assign(M, { max, preview, ok, onCancel });
+  Object.assign(M, { max, preview, ok, onCancel, busy: false });
+  M.seq++;
+  $("#modal-ok").disabled = false;
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML = html;
   $("#modal-input").classList.toggle("hidden", !input);
@@ -511,6 +517,7 @@ function openModal({ title, html = "", input = false, max = null, preview = null
 }
 function closeModal(cancelled) {
   if ($("#modal").classList.contains("hidden")) return;
+  if (cancelled && M.busy) return; // the request is already on its way; wait for its answer
   $("#modal").classList.add("hidden");
   if (cancelled && M.onCancel) M.onCancel();
   M.ok = null;
@@ -518,20 +525,31 @@ function closeModal(cancelled) {
 $("#modal-amount").addEventListener("input", () => { if (M.preview) $("#modal-preview").innerHTML = M.preview($("#modal-amount").value.trim()); });
 $("#modal-max").addEventListener("click", () => { $("#modal-amount").value = M.max; $("#modal-amount").dispatchEvent(new Event("input")); });
 $("#modal-cancel").addEventListener("click", () => closeModal(true));
-$("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(true); });
+// a click that started inside the card (e.g. selecting text) and ended on the backdrop is not a dismissal
+let downOnBackdrop = false;
+$("#modal").addEventListener("mousedown", (e) => { downOnBackdrop = e.target.id === "modal"; });
+$("#modal").addEventListener("click", (e) => { if (e.target.id === "modal" && downOnBackdrop) closeModal(true); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(true); });
 $("#modal-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const btn = $("#modal-ok"); btn.disabled = true;
-  try { await M.ok($("#modal-amount").value.trim()); closeModal(false); } catch (ex) { $("#modal-err").textContent = ex.message; }
-  btn.disabled = false;
+  if (M.busy || !M.ok) return;
+  const seq = M.seq, btn = $("#modal-ok");
+  btn.disabled = true; M.busy = true;
+  try {
+    await M.ok($("#modal-amount").value.trim());
+    if (seq === M.seq) { M.busy = false; closeModal(false); }
+  } catch (ex) {
+    if (seq === M.seq) $("#modal-err").textContent = ex.message;
+  } finally {
+    if (seq === M.seq) { M.busy = false; btn.disabled = false; }
+  }
 });
 
 /// Add (+) or remove (-) margin on an isolated position.
 function marginDialog(sym, add) {
   const p = position(sym); if (!p || !S.fut) return;
-  const limit = add ? +S.fut.available : +p.margin_removable;
-  const max = String(floorTo(limit, 2));
+  const limit = floorTo(Math.max(0, add ? +S.fut.available : +p.margin_removable), 2);
+  const max = String(limit);
   openModal({
     title: `${t(add ? "add_margin" : "remove_margin")} · ${sym} ${t(p.side)} ${fmtQty(p.size)}`,
     html: `<div class="fut-stats"><div><span>${esc(t("cur_margin"))}</span><b>$${fmtUsd(p.margin)}</b></div>` +
@@ -545,14 +563,16 @@ function marginDialog(sym, add) {
     },
     okLabel: t(add ? "add_margin" : "remove_margin"),
     ok: async (v) => {
-      S.fut = await api("/futures/margin", { method: "POST", body: { symbol: sym, amount: (add ? "" : "-") + v } });
+      const a = +v;
+      if (!(a > 0)) throw new Error(t("bad_amount"));
+      S.fut = await api("/futures/margin", { method: "POST", body: { symbol: sym, amount: String(add ? a : -a) } });
       toast(`${sym}: ${t(add ? "add_margin" : "remove_margin")} $${fmtUsd(v)}`, "good");
       refreshSoon();
     },
   });
 }
 form.margin_mode.addEventListener("change", saveFutSettings);
-form.leverage.addEventListener("change", saveFutSettings);
+form.leverage.addEventListener("change", queueFutSettings);
 
 function renderFutPanel() {
   const a = S.fut; if (!a) return;
@@ -646,7 +666,8 @@ let tabRows = [];
 async function loadTab() {
   const tab = S.tab;
   try { const rows = await TABS[tab].load(); if (tab === S.tab) { tabRows = rows; renderTab(); } } catch {}
-  if (tab !== "open") api("/orders").then((r) => ($("#open-count").textContent = r.orders.length || "")).catch(() => {});
+  if (tab === "open") S.orders = tabRows;
+  else api("/orders").then((r) => { S.orders = r.orders; $("#open-count").textContent = r.orders.length || ""; }).catch(() => {});
   $("#pos-count").textContent = S.fut && S.fut.positions.length ? S.fut.positions.length : "";
 }
 function renderTab() {

@@ -750,7 +750,10 @@ impl Engine {
                 o.queue_ahead = Some(qa - eaten);
                 avail = avail.min(qty - eaten);
             }
-            let f = floor_to(avail.min(o.remaining()), qty_inc);
+            let mut f = floor_to(avail.min(o.remaining()), qty_inc);
+            if f > Decimal::ZERO && self.perps.contains_key(symbol) {
+                f = self.fut_maker_cap(id, p, f, now);
+            }
             if f > Decimal::ZERO {
                 self.apply_fill(id, p, f, false, now);
                 budget -= f;
@@ -816,7 +819,10 @@ impl Engine {
                     break;
                 }
                 let Some(o) = self.orders.get(&id) else { break };
-                let f = o.remaining().min(avail);
+                let mut f = o.remaining().min(avail);
+                if f > Decimal::ZERO && self.perps.contains_key(symbol) {
+                    f = self.fut_maker_cap(id, p, f, now);
+                }
                 if f <= Decimal::ZERO {
                     break;
                 }

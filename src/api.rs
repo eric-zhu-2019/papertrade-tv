@@ -455,12 +455,21 @@ async fn fut_transfer(State(st): State<AppState>, a: Auth, Json(b): Json<Value>)
     Ok(Json(e.fut_account_json(a.0.id)))
 }
 
-/// {"symbol": "BTC-PERP", "margin_mode": "isolated" | "cross", "leverage": 10}
+/// {"symbol": "BTC-PERP", "margin_mode": "isolated" | "cross", "leverage": 10}; with "dry_run": true
+/// it only returns what a leverage change would do (margin and liquidation price before/after).
 async fn fut_settings(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
     let symbol = perp_of(&st, &b)?;
     let mode = MarginMode::parse(field(&b, "margin_mode")).ok_or_else(|| bad("margin_mode must be isolated or cross"))?;
     let leverage = dec(&b["leverage"]).ok_or_else(|| bad("leverage is required"))?;
     let mut e = st.engine.lock().unwrap();
+    if b["dry_run"].as_bool().unwrap_or(false) {
+        // what this leverage would do to the position and open orders, without doing it
+        let max = e.perps.get(&symbol).map(|p| p.max_leverage()).unwrap_or(rust_decimal::Decimal::ONE);
+        if leverage < rust_decimal::Decimal::ONE || leverage > max || !leverage.fract().is_zero() {
+            return Err(bad(format!("leverage must be a whole number from 1 to {max}")));
+        }
+        return Ok(Json(e.plan_leverage(a.0.id, &symbol, leverage, now_ms()).map_err(bad)?.json()));
+    }
     e.set_fut_settings(a.0.id, &symbol, mode, leverage, now_ms()).map_err(bad)?;
     Ok(Json(e.fut_account_json(a.0.id)))
 }

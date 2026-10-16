@@ -768,18 +768,21 @@ fn partial_close_loss_comes_from_the_rest_of_the_margin_first() {
 }
 
 #[test]
-fn isolated_leverage_change_resizes_the_margin() {
+fn isolated_leverage_change_tops_up_or_releases_within_the_margin_floor() {
     let (mut e, uid) = fut_setup();
     go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None)); // 10 @ 100.1 at 10x: margin 100.1
     let margin = |e: &Engine| e.positions[&(uid, PERP.to_string())].margin;
     let w0 = wallet(&e, uid);
-    // 20x: margin = entry value / 20, half comes back; the liquidation price moves closer
+    // 20x: entry value / 20 would be 50.05, but "remove margin" at 20x keeps initial margin at the
+    // mark (50) plus the unrealised loss (1), so 51 stays and 49.1 comes back
+    let plan = e.plan_leverage(uid, PERP, d("20"), T0).unwrap();
+    assert_eq!((plan.margin_before, plan.margin_after), (d("100.1"), d("51")));
     e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).unwrap();
-    assert_eq!((margin(&e), wallet(&e, uid)), (d("50.05"), w0 + d("50.05")));
+    assert_eq!((margin(&e), wallet(&e, uid)), (d("51"), w0 + d("49.1")));
     let p = e.positions[&(uid, PERP.to_string())].clone();
     assert_eq!(p.leverage, d("20"));
-    assert_eq!(e.liq_price(&p).unwrap().round_dp(4), d("95.5729"));
-    // 5x: topped up from the wallet
+    assert_eq!(e.liq_price(&p), plan.liq_after); // the preview is what happens
+    // 5x: topped up to entry value / 5
     e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("5"), T0).unwrap();
     assert_eq!((margin(&e), wallet(&e, uid)), (d("200.2"), w0 - d("100.1")));
     audit(&e);
@@ -787,21 +790,101 @@ fn isolated_leverage_change_resizes_the_margin() {
     // 1x would need 800.8 more than the wallet can spare
     let avail = e.fut_available(uid);
     e.fut_transfer(uid, avail - d("100"), false, T0).unwrap();
-    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1"), T0).is_err());
+    let err = e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1"), T0).unwrap_err();
+    assert!(err.contains("needs 800.80 more"), "{err}");
     assert_eq!(margin(&e), d("200.2"));
-    // opening orders were reserved at the old leverage and block a change; reduce-only ones do not
+    // open orders don't block a change: they are re-reserved at the new leverage
     let o = e.place_order(uid, preq(Side::Buy, OType::Limit, "0.5", Some("95.0")), T0).unwrap();
     e.activate(o.id, T0);
-    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("6"), T0).is_err());
-    e.cancel_order(uid, o.id, T0).unwrap();
-    let stop = OrderReq { reduce_only: true, trigger_price: Some(d("90.0")), ..preq(Side::Sell, OType::StopLoss, "10", None) };
-    e.place_order(uid, stop, T0).unwrap();
-    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("6"), T0).unwrap();
-    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("6"), T0).is_err()); // no mode switch with a position
-    // after a loss, releasing margin for 20x would leave the position below initial margin
+    assert_eq!(d(order(&e, uid, o.id)["locked"].as_str().unwrap()), d("9.52375")); // 0.5 * 95 * (1/5 + 0.0005)
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("10"), T0).unwrap();
+    assert_eq!(d(order(&e, uid, o.id)["locked"].as_str().unwrap()), d("4.77375")); // at 10x
+    assert_eq!(e.fut[&uid].locked, d("4.77375"));
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("10"), T0).is_err()); // no mode switch with a position
+    // after a loss nothing is above the floor, so raising leverage releases nothing (and is not refused)
     perp_book(&mut e, "92.0", "92.1");
     perp_mark(&mut e, "92");
-    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).is_err());
+    let before = margin(&e);
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).unwrap();
+    assert_eq!(margin(&e), before);
+    audit(&e);
+}
+
+#[test]
+fn lowering_leverage_keeps_margin_added_by_hand() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    e.adjust_margin(uid, PERP, d("100"), T0).unwrap(); // 200.1
+    let liq = e.liq_price(&e.positions[&(uid, PERP.to_string())]).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("9"), T0).unwrap();
+    let p = e.positions[&(uid, PERP.to_string())].clone();
+    assert_eq!((p.margin, p.leverage), (d("200.1"), d("9")));
+    assert_eq!(e.liq_price(&p).unwrap(), liq);
+    audit(&e);
+}
+
+#[test]
+fn raising_leverage_cannot_bypass_the_remove_margin_floor() {
+    let (mut e, uid) = fut_setup();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("5"), T0).unwrap();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None)); // margin 200.2
+    perp_book(&mut e, "92.0", "92.1");
+    perp_mark(&mut e, "92"); // unrealised loss 81
+    assert_eq!(e.margin_removable(&e.positions[&(uid, PERP.to_string())]), Decimal::ZERO);
+    let w = wallet(&e, uid);
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("10"), T0).unwrap();
+    // at 10x the floor is 92 + 81 = 173: 27.2 may leave, not 100.1
+    assert_eq!(wallet(&e, uid) - w, d("27.2"));
+    assert_eq!(e.margin_removable(&e.positions[&(uid, PERP.to_string())]), Decimal::ZERO);
+    audit(&e);
+}
+
+#[test]
+fn margin_changes_wait_for_live_market_data() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    e.adjust_margin(uid, PERP, d("100"), T0).unwrap();
+    e.fut_feed_down();
+    let later = T0 + 60_000;
+    assert!(e.adjust_margin(uid, PERP, d("-50"), later).is_err());
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("50"), later).is_err());
+    assert!(e.fut_transfer(uid, d("100"), false, later).is_err()); // positions can't be valued
+    assert_eq!(e.positions[&(uid, PERP.to_string())].margin, d("200.1"));
+    audit(&e);
+}
+
+#[test]
+fn closing_needs_no_free_margin_after_a_max_top_up() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    let max = floor_to(e.fut_available(uid), d("0.01"));
+    e.adjust_margin(uid, PERP, max, T0).unwrap();
+    perp_book(&mut e, "99.0", "99.1");
+    perp_mark(&mut e, "99");
+    go(&mut e, uid, OrderReq { reduce_only: true, ..preq(Side::Sell, OType::Market, "10", None) });
+    assert!(e.positions.is_empty());
+    audit(&e);
+}
+
+#[test]
+fn a_stale_closing_order_cannot_open_an_unbacked_position() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None));
+    // a take-profit that only closes, without the reduce-only flag: it reserves nothing
+    let tp = e.place_order(uid, preq(Side::Sell, OType::Limit, "10", Some("110.0")), T0).unwrap();
+    e.activate(tp.id, T0);
+    assert_eq!(e.fut[&uid].locked, Decimal::ZERO);
+    // the leverage can change with it resting (its need is re-computed, still zero)
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).unwrap();
+    // the long is closed another way and every free dollar moved out
+    go(&mut e, uid, OrderReq { reduce_only: true, ..preq(Side::Sell, OType::Market, "10", None) });
+    let avail = e.fut_available(uid);
+    e.fut_transfer(uid, avail, false, T0).unwrap();
+    // the market trades up through 110: with no margin behind it the order is cancelled, not filled
+    e.on_trade(PERP, d("110.0"), d("30"), Side::Buy, T0, true, T0);
+    assert!(e.positions.is_empty());
+    assert_eq!(order(&e, uid, tp.id)["status"], "canceled");
+    assert!(wallet(&e, uid) >= Decimal::ZERO);
     audit(&e);
 }
 
@@ -818,8 +901,16 @@ fn cross_leverage_change_changes_free_margin() {
         assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d(lev), T0).is_err(), "{lev}x");
     }
     assert_eq!(e.positions[&(uid, PERP.to_string())].leverage, d("50")); // a refused change leaves it alone
+    // raising is always allowed, even when the account is already short of initial margin
+    perp_book(&mut e, "105.0", "105.1");
+    perp_mark(&mut e, "105"); // short loses 50: free margin 99.5 - 21 - 50 < 0 at 50x
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("100"), T0).unwrap();
+    perp_book(&mut e, "100.0", "100.1");
+    perp_mark(&mut e, "100");
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("50"), T0).unwrap(); // back down: 20 tied up, affordable
     e.set_fut_settings(uid, PERP, MarginMode::Cross, d("12"), T0).unwrap();
     assert_eq!(e.fut_available(uid).round_dp(2), d("16.17")); // 99.5 - 1000/12
+    assert_eq!(e.plan_leverage(uid, PERP, d("12"), T0).unwrap().margin_before, d("83.33333333"));
     audit(&e);
 }
 
@@ -841,6 +932,10 @@ fn adding_margin_moves_the_liquidation_price_away() {
     perp_mark(&mut e, "100");
     // removable: 200.1 margin - 1 unrealised loss - 100 initial margin at 10x
     assert_eq!(e.margin_removable(&e.positions[&(uid, PERP.to_string())]), d("99.1"));
+    // a negative margin (funding has no floor) never shows a negative removable amount
+    let mut drained = e.positions[&(uid, PERP.to_string())].clone();
+    drained.margin = d("-0.5");
+    assert_eq!(e.margin_removable(&drained), Decimal::ZERO);
     assert!(e.adjust_margin(uid, PERP, d("-99.2"), T0).is_err());
     e.adjust_margin(uid, PERP, d("-99.1"), T0).unwrap();
     assert_eq!(e.positions[&(uid, PERP.to_string())].margin, d("101"));

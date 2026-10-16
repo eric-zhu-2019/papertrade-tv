@@ -97,6 +97,28 @@ pub struct FutAcct {
     pub locked: Decimal,
 }
 
+/// Outcome of a leverage change (see `Engine::plan_leverage`). Margin figures are the isolated
+/// margin, or for cross the initial margin tied up.
+#[derive(Clone, Debug, Default)]
+pub struct LevPlan {
+    pub has_position: bool,
+    pub margin_before: Decimal,
+    pub margin_after: Decimal,
+    pub liq_before: Option<Decimal>,
+    pub liq_after: Option<Decimal>,
+    /// Change in what the market's open orders reserve.
+    pub lock_delta: Decimal,
+}
+
+impl LevPlan {
+    pub fn json(&self) -> Value {
+        json!({
+            "has_position": self.has_position, "margin_before": s8(self.margin_before), "margin_after": s8(self.margin_after),
+            "liq_before": self.liq_before.map(s8), "liq_after": self.liq_after.map(s8), "orders_lock_delta": s8(self.lock_delta),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Position {
     pub id: i64,
@@ -278,9 +300,7 @@ impl Engine {
     }
 
     /// Change a market's margin mode or leverage. The mode can only change with no position and
-    /// no orders. Leverage can change while a position is open: an isolated position's margin is
-    /// reset to entry value / new leverage (topped up from or released to the wallet), a cross
-    /// position just ties up a different amount of initial margin.
+    /// no orders. Leverage can change at any time; see `plan_leverage` for what that does.
     pub fn set_fut_settings(&mut self, uid: i64, symbol: &str, mode: MarginMode, leverage: Decimal, now: i64) -> Result<(), String> {
         let max = self.perps.get(symbol).ok_or("unknown futures market")?.max_leverage();
         if leverage < Decimal::ONE || leverage > max || !leverage.fract().is_zero() {
@@ -288,17 +308,24 @@ impl Engine {
         }
         let key = (uid, symbol.to_string());
         let (cur_mode, cur_lev) = self.fut_settings(uid, symbol);
-        let has_orders = self.orders.values().any(|o| o.user_id == uid && o.symbol == symbol);
-        if mode != cur_mode && (self.positions.contains_key(&key) || has_orders) {
+        if mode == cur_mode && leverage == cur_lev {
+            return Ok(()); // nothing to change (spinner clicks and repeated requests are free)
+        }
+        if mode != cur_mode
+            && (self.positions.contains_key(&key) || self.orders.values().any(|o| o.user_id == uid && o.symbol == symbol))
+        {
             return Err("close the position and cancel open orders on this market before switching margin mode".into());
         }
         if leverage != cur_lev {
-            // their reservations were sized for the old leverage; reduce-only orders reserve no margin
-            if self.orders.values().any(|o| o.user_id == uid && o.symbol == symbol && !o.reduce_only) {
-                return Err("cancel the orders that would open or grow this position before changing leverage (reduce-only orders can stay)".into());
-            }
-            if self.positions.contains_key(&key) {
-                self.relever(uid, symbol, leverage, now)?;
+            let plan = self.plan_leverage(uid, symbol, leverage, now)?;
+            if let Some(mut p) = self.positions.get(&key).cloned() {
+                if p.mode == MarginMode::Isolated {
+                    self.move_margin(&mut p, plan.margin_after - plan.margin_before, now);
+                }
+                p.leverage = leverage;
+                p.updated_ms = now;
+                self.save_pos(&p);
+                self.positions.insert(key.clone(), p);
             }
         }
         self.fut_prefs.insert(key, (mode, leverage));
@@ -309,54 +336,88 @@ impl Engine {
                 params![uid, symbol, mode.as_str(), leverage.to_string()],
             )
             .unwrap();
+        // open orders on this market were reserved at the old leverage: re-size them
+        let ids: Vec<i64> = self.orders.values().filter(|o| o.user_id == uid && o.symbol == symbol).map(|o| o.id).collect();
+        for id in ids {
+            let need = self.fut_order_need(&self.orders[&id]);
+            let o = self.orders.get_mut(&id).unwrap();
+            let delta = need - o.locked;
+            o.locked = need;
+            let snap = o.clone();
+            self.fut.entry(uid).or_default().locked += delta;
+            self.save_order(&snap);
+            self.emit_order(&snap);
+        }
+        self.save_fut(uid);
         self.commit();
         self.emit_fut(uid);
         Ok(())
     }
 
-    /// New leverage for an open position. Raising it is refused only if the released margin
-    /// would leave the position at or below maintenance margin, i.e. liquidated on the spot.
-    fn relever(&mut self, uid: i64, symbol: &str, leverage: Decimal, now: i64) -> Result<(), String> {
-        let key = (uid, symbol.to_string());
-        let mut p = self.positions[&key].clone();
-        let mark = self.fut_mark(symbol).ok_or("no mark price right now; try again in a moment")?;
-        let (im, mm) = self.rates(symbol, p.size.abs() * mark, leverage);
-        match p.mode {
-            MarginMode::Cross => {
-                let old = p.leverage;
-                self.positions.get_mut(&key).unwrap().leverage = leverage;
-                if self.fut_free_raw(uid) < Decimal::ZERO {
-                    self.positions.get_mut(&key).unwrap().leverage = old;
-                    return Err(format!(
-                        "not enough free margin for {leverage}x: lower leverage ties up more margin; transfer USD in or choose a higher leverage"
-                    ));
-                }
-                p.leverage = leverage;
+    /// What setting `leverage` on a market would do, without doing it. The same rules apply to
+    /// a dry run (the UI's preview) and to the real change:
+    /// * isolated, lower leverage: margin is topped up to entry value / leverage if it is below
+    ///   that; margin added by hand stays;
+    /// * isolated, higher leverage: margin is released down to entry value / leverage, but never
+    ///   further than "remove margin" would allow (initial margin at today's mark, unrealised
+    ///   profit not counted);
+    /// * cross: only the initial margin tied up changes; raising is always allowed;
+    /// * open orders on the market are re-reserved at the new leverage.
+    /// Anything that needs more USD than is available is refused.
+    pub fn plan_leverage(&self, uid: i64, symbol: &str, leverage: Decimal, now: i64) -> Result<LevPlan, String> {
+        let mut plan = LevPlan::default();
+        for o in self.orders.values().filter(|o| o.user_id == uid && o.symbol == symbol) {
+            plan.lock_delta += self.fut_order_need_at(o, leverage) - o.locked;
+        }
+        let mut need = plan.lock_delta;
+        if let Some(p) = self.positions.get(&(uid, symbol.to_string())) {
+            if !self.tradable(symbol, now) {
+                return Err("market data for this market is unavailable right now; try again shortly".into());
             }
-            MarginMode::Isolated => {
-                let target = round8(p.size.abs() * p.entry * im);
-                let delta = target - p.margin;
-                if delta > Decimal::ZERO {
-                    let avail = self.fut_available(uid);
-                    if delta > avail {
-                        return Err(format!(
-                            "{leverage}x needs {} more margin for this position but only {} is available",
-                            delta.round_dp(2),
-                            avail.round_dp(2)
-                        ));
-                    }
-                } else if target + p.upnl(mark) <= p.size.abs() * mark * mm {
-                    // releasing that much margin would get the position liquidated straight away
-                    return Err(format!("the position has lost too much to run at {leverage}x; add margin or keep a lower leverage"));
+            let mark = self.fut_mark(symbol).ok_or("no mark price right now; try again shortly")?;
+            let value = p.size.abs() * mark;
+            let (im_new, _) = self.rates(symbol, value, leverage);
+            plan.has_position = true;
+            plan.liq_before = self.liq_price(p);
+            match p.mode {
+                MarginMode::Isolated => {
+                    let target = round8(p.size.abs() * p.entry * im_new);
+                    let after = if leverage < p.leverage {
+                        p.margin.max(target)
+                    } else if leverage > p.leverage {
+                        (p.margin - self.removable_at(p, leverage, mark)).max(target).min(p.margin)
+                    } else {
+                        p.margin
+                    };
+                    plan.margin_before = p.margin;
+                    plan.margin_after = after;
+                    need += after - p.margin;
+                    let mut q = p.clone();
+                    q.margin = after;
+                    q.leverage = leverage;
+                    plan.liq_after = self.liq_price(&q);
                 }
-                self.move_margin(&mut p, delta, now);
-                p.leverage = leverage;
+                MarginMode::Cross => {
+                    let (im_old, _) = self.rates(symbol, value, p.leverage);
+                    plan.margin_before = round8(value * im_old);
+                    plan.margin_after = round8(value * im_new);
+                    need += plan.margin_after - plan.margin_before;
+                    plan.liq_after = plan.liq_before; // cross liquidation depends on maintenance margin only
+                }
             }
         }
-        p.updated_ms = now;
-        self.save_pos(&p);
-        self.positions.insert(key, p);
-        Ok(())
+        if need > Decimal::ZERO {
+            let avail = self.fut_available(uid);
+            if need > avail {
+                return Err(format!(
+                    "{leverage}x needs {} more {} than is available ({}); transfer USD in or choose a higher leverage",
+                    ceil_dp(need, 2),
+                    self.cfg.quote,
+                    floor_dp(avail, 2)
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Add (positive) or remove (negative) margin on an isolated position.
@@ -369,15 +430,18 @@ impl Engine {
         if p.mode != MarginMode::Isolated {
             return Err("only isolated positions have their own margin; a cross position is backed by the whole futures wallet".into());
         }
+        if !self.tradable(symbol, now) {
+            return Err("market data for this market is unavailable right now; try again shortly".into());
+        }
         if amount > Decimal::ZERO {
             let avail = self.fut_available(uid);
             if amount > avail {
-                return Err(format!("only {} {} is available in the futures wallet", avail.round_dp(2), self.cfg.quote));
+                return Err(format!("only {} {} is available in the futures wallet", floor_dp(avail, 2), self.cfg.quote));
             }
         } else {
             let max = self.margin_removable(&p);
             if -amount > max {
-                return Err(format!("at most {} can be removed while keeping the initial margin for {}x", max.round_dp(2), p.leverage));
+                return Err(format!("at most {} can be removed while keeping the initial margin for {}x", floor_dp(max, 2), p.leverage));
             }
         }
         self.move_margin(&mut p, amount, now);
@@ -392,11 +456,19 @@ impl Engine {
     /// How much margin an isolated position can give back while still holding the initial margin
     /// for its leverage at today's mark. Unrealised profit does not count.
     pub fn margin_removable(&self, p: &Position) -> Decimal {
-        let Some(mark) = self.fut_mark(&p.symbol) else { return Decimal::ZERO };
+        match self.fut_mark(&p.symbol) {
+            Some(mark) => self.removable_at(p, p.leverage, mark),
+            None => Decimal::ZERO,
+        }
+    }
+
+    /// `margin_removable` at a given leverage and mark: the one floor both "remove margin" and a
+    /// leverage increase respect.
+    fn removable_at(&self, p: &Position, leverage: Decimal, mark: Decimal) -> Decimal {
         let value = p.size.abs() * mark;
-        let (im, _) = self.rates(&p.symbol, value, p.leverage);
-        let floor = ceil8(value * im);
-        (p.margin + p.upnl(mark).min(Decimal::ZERO) - floor).max(Decimal::ZERO).min(p.margin).round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero)
+        let (im, _) = self.rates(&p.symbol, value, leverage);
+        let floor = ceil8(value * im) - p.upnl(mark).min(Decimal::ZERO);
+        floor_dp((p.margin - floor).min(p.margin), 8).max(Decimal::ZERO)
     }
 
     /// Move USD between the futures wallet and an isolated position (positive = into the position).
@@ -509,6 +581,7 @@ impl Engine {
                 "size": s8(p.size.abs()), "entry": s8(p.entry), "mark": s8(mark), "value": s8(value),
                 "liq_price": self.liq_price(p).map(s8), "margin_mode": p.mode.as_str(), "leverage": p.leverage.to_string(),
                 "margin_removable": s8(if p.mode == MarginMode::Isolated { self.margin_removable(p) } else { Decimal::ZERO }),
+                "maint_rate": mm.normalize().to_string(),
                 "margin": s8(margin), "maint_margin": s8(value * mm), "unrealized_pnl": s8(upnl),
                 "roe_pct": if margin > Decimal::ZERO { s8(upnl / margin * Decimal::ONE_HUNDRED) } else { "0".into() },
                 "realized": s8(p.realized), "fees": s8(p.fees), "funding": s8(p.funding), "opened_ms": p.opened_ms,
@@ -547,11 +620,14 @@ impl Engine {
             self.balances.entry((uid, quote.clone())).or_default().total -= amount;
             self.fut.entry(uid).or_default().wallet += amount;
         } else {
+            if !self.fut_feed_ok(now) && self.positions.keys().any(|k| k.0 == uid) {
+                return Err("futures market data is unavailable, so open positions can't be valued; try again shortly".into());
+            }
             let avail = self.fut_available(uid);
             if amount > avail {
                 return Err(format!(
                     "only {} {quote} can leave the futures account now (the rest backs positions and open orders)",
-                    avail.round_dp(2)
+                    floor_dp(avail, 2)
                 ));
             }
             self.fut.entry(uid).or_default().wallet -= amount;
@@ -603,7 +679,8 @@ impl Engine {
         }
         let (_, lev) = self.fut_settings(uid, &req.symbol);
         let (im, _) = self.rates(&req.symbol, new_size * ref_price, lev);
-        let reserve = ceil8(open_qty * ref_price * im + req.qty * ref_price * self.cfg.fut_max_fee());
+        // a closing part needs no reservation: its fee is paid from what the close hands back
+        let reserve = ceil8(open_qty * ref_price * (im + self.cfg.fut_max_fee()));
         let avail = self.fut_available(uid);
         if reserve > avail {
             return Err(format!(
@@ -618,17 +695,32 @@ impl Engine {
 
     /// What an open perp order still needs reserved for its unfilled part.
     fn fut_order_need(&self, o: &Order) -> Decimal {
+        self.fut_order_need_at(o, self.fut_settings(o.user_id, &o.symbol).1)
+    }
+
+    /// The same at a given leverage: initial margin and fees for the part that would open or grow a position.
+    fn fut_order_need_at(&self, o: &Order, leverage: Decimal) -> Decimal {
         let rem = o.remaining();
-        if rem <= Decimal::ZERO {
+        if rem <= Decimal::ZERO || o.reduce_only {
             return Decimal::ZERO;
         }
         let px = o.limit_price.or(o.trigger_price).or_else(|| self.fut_mark(&o.symbol)).unwrap_or_default();
         let closable = self.fut_closable(o.user_id, &o.symbol, o.side);
-        let open_qty = if o.reduce_only { Decimal::ZERO } else { (rem - closable).max(Decimal::ZERO) };
+        let open_qty = (rem - closable).max(Decimal::ZERO);
         let held = self.positions.get(&(o.user_id, o.symbol.clone())).map(|p| p.size.abs()).unwrap_or_default();
-        let (_, lev) = self.fut_settings(o.user_id, &o.symbol);
-        let (im, _) = self.rates(&o.symbol, (held + open_qty) * px, lev);
-        ceil8(open_qty * px * im + rem * px * self.cfg.fut_max_fee())
+        let (im, _) = self.rates(&o.symbol, (held + open_qty) * px, leverage);
+        ceil8(open_qty * px * (im + self.cfg.fut_max_fee()))
+    }
+
+    /// A resting perp order filled as maker may open or grow a position only as far as its margin
+    /// allows: it may have been placed to close a position that is gone by now. With no margin
+    /// for any of it, it is cancelled rather than left to fill unbacked later.
+    pub(crate) fn fut_maker_cap(&mut self, oid: i64, price: Decimal, qty: Decimal, now: i64) -> Decimal {
+        let cap = self.fut_max_fill(oid, price);
+        if cap.is_zero() {
+            self.finish(oid, Status::Canceled, Some("not enough futures margin to open a position with this order"), now);
+        }
+        qty.min(cap)
     }
 
     pub(crate) fn fut_lock(&mut self, uid: i64, amount: Decimal) {
@@ -1208,6 +1300,9 @@ impl Engine {
             }
             let locked: Decimal =
                 self.orders.values().filter(|o| o.user_id == *uid && self.perps.contains_key(&o.symbol)).map(|o| o.locked).sum();
+            if a.wallet < Decimal::ZERO && !self.positions.values().any(|p| p.user_id == *uid && p.mode == MarginMode::Cross) {
+                problems.push(format!("futures wallet of user {uid} is negative ({}) with no cross position", a.wallet));
+            }
             if locked != a.locked || a.locked < Decimal::ZERO {
                 problems.push(format!("futures wallet of user {uid}: locked {} != open-order reservations {locked}", a.locked));
             }

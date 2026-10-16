@@ -33,6 +33,16 @@ pub fn round8(x: Decimal) -> Decimal {
     x.round_dp_with_strategy(8, RoundingStrategy::MidpointAwayFromZero)
 }
 
+/// Round toward zero: for limits shown to users, so the number shown is always allowed.
+pub fn floor_dp(x: Decimal, dp: u32) -> Decimal {
+    x.round_dp_with_strategy(dp, RoundingStrategy::ToZero)
+}
+
+/// Round up: for amounts users are told they need, so the number shown is always enough.
+pub fn ceil_dp(x: Decimal, dp: u32) -> Decimal {
+    x.round_dp_with_strategy(dp, RoundingStrategy::ToPositiveInfinity)
+}
+
 pub fn ceil8(x: Decimal) -> Decimal {
     x.round_dp_with_strategy(8, RoundingStrategy::ToPositiveInfinity)
 }

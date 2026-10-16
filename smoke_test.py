@@ -696,12 +696,14 @@ class Run:
                 expect(D(p1["liq_price"]) < D(p0["liq_price"]), "追加保证金后多单强平价应该下移")
                 status, _ = a.call("POST", "/api/futures/margin", {"symbol": sym, "amount": fmt(-(D(p1["margin_removable"]) + 1))})
                 expect(status == 400, "减少的保证金超过上限居然成功了")
-                # 20x: margin reset to entry value / 20
+                # 20x: the dry run says what will happen, the change must match it
+                plan = a.post("/api/futures/settings", {"symbol": sym, "margin_mode": "isolated", "leverage": 20, "dry_run": True})
+                expect(pos(sym)["leverage"] == "10", "预演居然改了杠杆")
                 a.post("/api/futures/settings", {"symbol": sym, "margin_mode": "isolated", "leverage": 20})
                 p2 = pos(sym)
-                want = D(p2["size"]) * D(p2["entry"]) / 20
-                expect(p2["leverage"] == "20" and abs(D(p2["margin"]) - want) <= Decimal("0.01"), f"20x 后保证金 {p2['margin']}，应为 {want}")
-                expect(D(p2["liq_price"]) > D(p1["liq_price"]), "杠杆调高后多单强平价应该上移")
+                expect(p2["leverage"] == "20" and D(p2["margin"]) == D(plan["margin_after"]), f"20x 后保证金 {p2['margin']}，预演为 {plan['margin_after']}")
+                expect(D(p2["margin"]) <= D(p1["margin"]), "调高杠杆不应增加保证金")
+                expect(D(p2["liq_price"]) >= D(p1["liq_price"]), "杠杆调高后多单强平价不应下移")
                 status, _ = a.call("POST", "/api/futures/settings", {"symbol": sym, "margin_mode": "cross", "leverage": 20})
                 expect(status == 400, "持仓时切换全仓居然成功了")
                 return f"追加 10：强平价 {D(p0['liq_price']):.0f} → {D(p1['liq_price']):.0f}；调到 20x：保证金 {D(p2['margin']):.2f}，强平价 {D(p2['liq_price']):.0f}"
