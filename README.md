@@ -20,6 +20,14 @@ docker compose up -d --build
 - **一次性邀请码**：管理员在「管理 → 邀请码」批量生成（每批 1–100 个，可加备注），每个码只能注册一个账号，用过即失效，表里能看到谁用了哪个码。未用的码可以作废。注册失败（比如昵称被占用）不会消耗码。格式如 `CF2V-XCYN`，不含 0/O/1/I/L，输入时不区分大小写、可省略横线。
 - **公用邀请码**：`.env` 里的 `INVITE_CODE`，不限次数。留空则只能用一次性邀请码注册；两者都没有时注册关闭。修改后运行 `docker compose up -d` 生效。
 
+部署到自己的服务器（需要能 `ssh` 登录、装有 Docker）：
+
+```bash
+./deploy.sh my-server          # 或 DEPLOY_HOST=my-server ./deploy.sh
+```
+
+脚本把代码同步到 `~/apps/papertrade`，首次运行时生成随机的管理员密码和邀请码写入远程 `.env`，构建并启动容器，最后跑冒烟测试。之后再运行不会覆盖 `.env` 和数据库。
+
 不用 Docker 时运行 `cargo run --release`，环境变量同 `.env.example`。离线开发用 `FEED=sim cargo run`，价格为随机游走。
 
 ### nginx 反向代理

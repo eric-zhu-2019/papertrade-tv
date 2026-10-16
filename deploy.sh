@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Deploy to a Docker host over SSH:  ./deploy.sh [ssh-host] [remote-dir]
+# Deploy to a Docker host over SSH:  ./deploy.sh <ssh-host> [remote-dir]   (or DEPLOY_HOST=<ssh-host> ./deploy.sh)
 # Safe to re-run: it never overwrites the remote .env or the database volume.
 # Runs smoke_test.py on the host afterwards; SMOKE=0 ./deploy.sh skips it.
 set -euo pipefail
-HOST="${1:?usage: ./deploy.sh <ssh-host> [remote-dir]}"
+HOST="${1:-${DEPLOY_HOST:-}}"
+if [ -z "$HOST" ]; then
+  echo "usage: ./deploy.sh <ssh-host> [remote-dir]   (or set DEPLOY_HOST)" >&2
+  exit 2
+fi
 DIR="${2:-apps/papertrade}"
 cd "$(dirname "$0")"
 
 echo "==> copying project to $HOST:~/$DIR"
 ssh "$HOST" "mkdir -p $DIR"
-rsync -az --delete --exclude target --exclude .git --exclude .env --exclude data --exclude __pycache__ ./ "$HOST:$DIR/"
+rsync -az --delete --exclude target --exclude .git --exclude .env --exclude data --exclude __pycache__ --exclude CLAUDE.local.md ./ "$HOST:$DIR/"
 
 echo "==> building and starting on $HOST (the first build takes several minutes)"
 ssh "$HOST" "bash -s -- $DIR ${SMOKE:-1}" <<'REMOTE'
