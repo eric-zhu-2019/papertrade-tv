@@ -1,0 +1,12 @@
+services:
+  papertrade:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # reachable from the LAN by default; set PT_BIND=127.0.0.1 in .env to hide it behind nginx
+      - "${PT_BIND:-0.0.0.0}:${PT_PORT:-8080}:8080"
+    volumes:
+      - papertrade-data:/data
+volumes:
+  papertrade-data:

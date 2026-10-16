@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Exchange</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- sign in / register -->
+<section id="auth" class="hidden">
+  <div class="auth-card">
+    <h1 class="club-name">Paper Exchange</h1>
+    <p class="muted" data-t="tagline"></p>
+    <div class="seg" id="auth-mode">
+      <button data-mode="login" class="on" data-t="sign_in"></button>
+      <button data-mode="register" data-t="register"></button>
+    </div>
+    <form id="auth-form">
+      <label><span data-t="nickname"></span><input name="username" autocomplete="username" required maxlength="20"></label>
+      <label><span data-t="password"></span><input name="password" type="password" autocomplete="current-password" required></label>
+      <label id="invite-row" class="hidden"><span data-t="invite_code"></span><input name="invite_code" autocomplete="off"></label>
+      <p class="muted small hidden" id="register-hint" data-t="register_hint"></p>
+      <button class="primary" type="submit" data-t="continue"></button>
+      <p class="err" id="auth-err"></p>
+    </form>
+    <button class="link lang-toggle"></button>
+  </div>
+</section>
+
+<section id="app" class="hidden">
+  <header>
+    <div class="brand club-name">Paper Exchange</div>
+    <nav id="nav">
+      <button data-view="trade" class="on" data-t="nav_trade"></button>
+      <button data-view="board" data-t="nav_board"></button>
+      <button data-view="account" data-t="nav_account"></button>
+      <button data-view="admin" class="hidden" id="nav-admin" data-t="nav_admin"></button>
+    </nav>
+    <div class="right">
+      <span class="pill" id="season-pill"></span>
+      <span class="equity"><span class="muted" data-t="equity"></span> <b id="hdr-equity">–</b> <span id="hdr-ret"></span></span>
+      <span id="feed-dot" class="dot" title=""></span>
+      <span id="hdr-user" class="muted"></span>
+      <button class="link lang-toggle"></button>
+      <button class="link" id="logout" data-t="sign_out"></button>
+    </div>
+  </header>
+  <div id="banner" class="banner hidden"></div>
+
+  <!-- trade -->
+  <main id="view-trade" class="view">
+    <aside id="markets"></aside>
+    <section class="center">
+      <div class="panel chart-panel">
+        <div class="chart-head">
+          <div><b id="sym-name">–</b> <span id="sym-last" class="big">–</span> <span id="sym-chg"></span></div>
+          <div class="muted small" id="sym-stats"></div>
+          <div class="seg" id="intervals"></div>
+        </div>
+        <div id="chart"></div>
+      </div>
+      <div class="panel">
+        <div class="tabs" id="tabs">
+          <button data-tab="open" class="on"><span data-t="tab_open"></span> <span id="open-count" class="count"></span></button>
+          <button data-tab="history" data-t="tab_history"></button>
+          <button data-tab="fills" data-t="tab_fills"></button>
+          <button data-tab="balances" data-t="tab_balances"></button>
+          <button class="link right-btn" id="cancel-all" data-t="cancel_all"></button>
+        </div>
+        <div class="table-wrap"><table id="tab-table"></table></div>
+      </div>
+    </section>
+    <aside class="side">
+      <div class="panel book-panel">
+        <h3 data-t="order_book"></h3>
+        <div class="book-head"><span data-t="price"></span><span data-t="size"></span><span data-t="total"></span></div>
+        <div id="asks" class="book-side"></div>
+        <div id="spread" class="spread"></div>
+        <div id="bids" class="book-side"></div>
+      </div>
+      <div class="panel form-panel">
+        <div class="seg side-seg" id="side-seg">
+          <button data-side="buy" class="on buy" data-t="buy"></button>
+          <button data-side="sell" class="sell" data-t="sell"></button>
+        </div>
+        <form id="order-form">
+          <label><span data-t="order_type"></span>
+            <select name="type">
+              <option value="limit" data-t="t_limit"></option>
+              <option value="market" data-t="t_market"></option>
+              <option value="stop-loss" data-t="t_stop"></option>
+              <option value="take-profit" data-t="t_tp"></option>
+              <option value="stop-loss-limit" data-t="t_stop_limit"></option>
+              <option value="take-profit-limit" data-t="t_tp_limit"></option>
+            </select>
+          </label>
+          <label id="row-trigger"><span data-t="trigger_price"></span><input name="trigger_price" inputmode="decimal" autocomplete="off"></label>
+          <label id="row-price"><span data-t="limit_price"></span><input name="limit_price" inputmode="decimal" autocomplete="off"></label>
+          <label><span><span data-t="quantity"></span> <span id="qty-unit" class="muted"></span></span><input name="qty" inputmode="decimal" autocomplete="off" required></label>
+          <div class="pcts" id="pcts"><button type="button" data-p="0.25">25%</button><button type="button" data-p="0.5">50%</button><button type="button" data-p="0.75">75%</button><button type="button" data-p="1">100%</button></div>
+          <div class="row2" id="row-tif">
+            <label><span data-t="tif"></span>
+              <select name="time_in_force"><option value="gtc">GTC</option><option value="ioc">IOC</option><option value="fok">FOK</option></select>
+            </label>
+            <label class="check"><input type="checkbox" name="post_only"> <span data-t="post_only"></span></label>
+          </div>
+          <label><span data-t="note"></span><textarea name="note" rows="2" maxlength="500" data-tp="note_ph"></textarea></label>
+          <div class="est muted small" id="est"></div>
+          <div class="muted small" id="avail"></div>
+          <button class="primary buy" id="submit-order" type="submit"></button>
+          <p class="err" id="order-err"></p>
+        </form>
+      </div>
+      <div class="panel tape-panel">
+        <h3 data-t="market_trades"></h3>
+        <div id="tape"></div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- leaderboard -->
+  <main id="view-board" class="view hidden page">
+    <div class="panel">
+      <h2><span data-t="leaderboard"></span> · <span id="board-season"></span></h2>
+      <p class="muted small" data-t="board_hint"></p>
+      <div class="table-wrap"><table id="board-table"></table></div>
+    </div>
+    <div class="panel">
+      <h3 id="curve-title" data-t="equity_curve"></h3>
+      <div id="board-chart" class="line-chart"></div>
+    </div>
+    <div class="panel hidden" id="past-panel">
+      <h3 data-t="past_seasons"></h3>
+      <div class="table-wrap"><table id="past-table"></table></div>
+    </div>
+  </main>
+
+  <!-- account -->
+  <main id="view-account" class="view hidden page">
+    <div class="panel">
+      <h2 data-t="my_account"></h2>
+      <div class="stats" id="acct-stats"></div>
+      <div id="acct-chart" class="line-chart"></div>
+    </div>
+    <div class="panel">
+      <h3 data-t="api_keys"></h3>
+      <p class="muted small" data-t="api_hint"></p>
+      <div class="table-wrap"><table id="keys-table"></table></div>
+      <form id="key-form" class="inline"><input name="label" data-tp="key_label" maxlength="40"><button data-t="create_key"></button></form>
+      <pre id="new-key" class="hidden"></pre>
+      <details><summary data-t="api_example"></summary><pre id="api-doc"></pre></details>
+    </div>
+    <div class="panel">
+      <h3 data-t="change_password"></h3>
+      <form id="pw-form" class="inline">
+        <input name="old_password" type="password" data-tp="current_password" autocomplete="current-password" required>
+        <input name="new_password" type="password" data-tp="new_password" autocomplete="new-password" required minlength="8">
+        <button data-t="save"></button>
+      </form>
+      <p class="err" id="pw-msg"></p>
+    </div>
+  </main>
+
+  <!-- admin -->
+  <main id="view-admin" class="view hidden page">
+    <div class="panel">
+      <h2 data-t="season"></h2>
+      <p><span data-t="current_season"></span>: <b id="adm-season"></b></p>
+      <p class="muted small" data-t="season_hint"></p>
+      <form id="season-form" class="inline"><input name="name" data-tp="season_name" maxlength="40" required><button class="danger" data-t="start_season"></button></form>
+      <p class="err" id="season-msg"></p>
+    </div>
+    <div class="panel">
+      <h3 data-t="invites"></h3>
+      <p class="muted small" data-t="invites_hint"></p>
+      <p><span data-t="shared_code"></span>: <code id="adm-invite"></code></p>
+      <form id="invite-form" class="inline">
+        <input name="count" type="number" min="1" max="100" value="10" required data-tp="invite_count" class="narrow">
+        <input name="note" data-tp="invite_note" maxlength="40">
+        <button data-t="create_invites"></button>
+        <button type="button" id="copy-invites" data-t="copy_unused"></button>
+      </form>
+      <p class="err" id="invites-msg"></p>
+      <pre id="invite-out" class="hidden"></pre>
+      <div class="table-wrap"><table id="invites-table"></table></div>
+    </div>
+    <div class="panel">
+      <h3 data-t="members"></h3>
+      <div class="table-wrap"><table id="users-table"></table></div>
+      <p class="err" id="users-msg"></p>
+    </div>
+    <div class="panel">
+      <h3 data-t="ledger_audit"></h3>
+      <p class="muted small" data-t="audit_hint"></p>
+      <button id="reconcile" data-t="run_audit"></button>
+      <pre id="reconcile-out" class="hidden"></pre>
+    </div>
+  </main>
+
+  <footer class="muted small">
+    <span data-t="footer"></span> ·
+    Charts: <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>
+  </footer>
+</section>
+
+<div id="toasts"></div>
+<script src="/lightweight-charts.js"></script>
+<script src="/i18n.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
