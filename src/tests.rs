@@ -734,3 +734,18 @@ fn kraken_futures_messages_drive_the_engine() {
     let gap = r#"{"feed":"book","product_id":"PF_XBTUSD","side":"sell","seq":13,"price":81507.0,"qty":1.0}"#;
     assert!(handle_fut_message(&mut e, gap, T0, &mut seqs).is_err());
 }
+
+#[test]
+fn funding_is_not_missed_when_the_ticker_rolls_over_first() {
+    let (mut e, alice) = fut_setup();
+    go(&mut e, alice, preq(Side::Buy, OType::Market, "10", None));
+    e.on_perp_ticker(PERP, Some(d("100")), None, Some(d("0.001")), Some(T0 + 1000), None, Ticker::default());
+    // just after the hour Kraken already shows the next period (new rate, next time an hour on)
+    e.on_perp_ticker(PERP, Some(d("100")), None, Some(d("0.005")), Some(T0 + 1000 + 3_600_000), None, Ticker::default());
+    e.fut_tick(T0 + 900); // our clock may lag the exchange's a little
+    let a = &e.positions[&(alice, PERP.to_string())];
+    assert_eq!(a.funding, d("-1")); // charged at the 0.001 that applied to the period that ended
+    e.fut_tick(T0 + 1300);
+    assert_eq!(e.positions[&(alice, PERP.to_string())].funding, d("-1"));
+    audit(&e);
+}

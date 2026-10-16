@@ -260,6 +260,8 @@ pub struct Engine {
     pub fut_feed_connected: bool,
     pub fut_last_feed_ms: i64,
     pub(crate) funding_done: HashMap<String, i64>,
+    /// Funding periods that ended, captured from tickers: (symbol, time, rate).
+    pub(crate) funding_due: Vec<(String, i64, Decimal)>,
 }
 
 const SCHEMA: &str = "
@@ -377,6 +379,7 @@ impl Engine {
             fut_feed_connected: false,
             fut_last_feed_ms: 0,
             funding_done: HashMap::new(),
+            funding_due: Vec::new(),
         };
         e.load();
         e
@@ -791,6 +794,15 @@ impl Engine {
                 (o.side, o.limit_price.unwrap_or(Decimal::ZERO))
             };
             let opp = side.opposite();
+            // most orders are nowhere near the other side of the book: skip them cheaply
+            let crossed = match (side, self.books[symbol].best(opp)) {
+                (Side::Buy, Some((best, _))) => best <= p,
+                (Side::Sell, Some((best, _))) => best >= p,
+                _ => false,
+            };
+            if !crossed {
+                continue;
+            }
             let levels = self.books[symbol].avail_levels(opp, now);
             for (lp, avail) in levels {
                 let crosses = match side {

@@ -214,6 +214,15 @@ impl Engine {
         t: Ticker,
     ) {
         let Some(p) = self.perps.get_mut(symbol) else { return };
+        // Right after the hour Kraken moves next_funding_rate_time on and publishes the next
+        // period's rate. Settle the period that just ended at the rate shown for it, before
+        // that information is overwritten, or the once-a-second tick could miss it.
+        if let (Some(old_ts), Some(old_rate), Some(new_ts)) = (p.next_funding_ms, p.funding_rate, next_funding_ms) {
+            if new_ts > old_ts {
+                self.funding_due.push((symbol.to_string(), old_ts, old_rate));
+            }
+        }
+        let Some(p) = self.perps.get_mut(symbol) else { return };
         p.mark = mark.or(p.mark);
         p.index = index.or(p.index);
         p.funding_rate = funding_rate.or(p.funding_rate);
@@ -668,16 +677,18 @@ impl Engine {
     }
 
     fn run_funding(&mut self, now: i64) {
-        let due: Vec<(String, i64, Decimal)> = self
-            .perps
-            .values()
-            .filter_map(|p| {
-                let (ts, rate) = (p.next_funding_ms?, p.funding_rate?);
-                (now >= ts && self.funding_done.get(&p.symbol).copied().unwrap_or(0) < ts).then(|| (p.symbol.clone(), ts, rate))
-            })
-            .collect();
+        // periods the exchange has already rolled past (whatever our clock says),
+        // then any that are due by our clock
+        let mut due: Vec<(String, i64, Decimal)> = std::mem::take(&mut self.funding_due);
+        due.extend(self.perps.values().filter_map(|p| {
+            let (ts, rate) = (p.next_funding_ms?, p.funding_rate?);
+            (now >= ts).then(|| (p.symbol.clone(), ts, rate))
+        }));
         let quote = self.cfg.quote.clone();
         for (sym, ts, rate) in due {
+            if self.funding_done.get(&sym).copied().unwrap_or(0) >= ts {
+                continue;
+            }
             let Some(mark) = self.fut_mark(&sym) else { continue };
             let keys: Vec<(i64, String)> = self.positions.keys().filter(|k| k.1 == sym).cloned().collect();
             for k in keys {

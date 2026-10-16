@@ -128,9 +128,11 @@ impl Book {
 
     /// Levels in price priority with the quantity still available to simulated takers.
     pub fn avail_levels(&self, side: Side, now: i64) -> Vec<Level> {
+        // a perp book keeps every level; no order walks further than this
+        let n = self.depth.min(1000);
         let (all, consumed) = match side {
-            Side::Buy => (self.top(Side::Buy, self.depth), &self.consumed_bids),
-            Side::Sell => (self.top(Side::Sell, self.depth), &self.consumed_asks),
+            Side::Buy => (self.top(Side::Buy, n), &self.consumed_bids),
+            Side::Sell => (self.top(Side::Sell, n), &self.consumed_asks),
         };
         all.into_iter()
             .filter_map(|(p, q)| {
