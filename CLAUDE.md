@@ -22,4 +22,4 @@
 
 - 金额一律用 `rust_decimal`，不用浮点；所有余额变动必须写复式账本（`Engine::transfer`），改动撮合后跑 `cargo test` 并确认 `reconcile()` 无差错。
 - 引擎是 `Arc<Mutex<Engine>>`，锁内不能 `await`。
-- 第二期永续合约在 `futures` 分支开发（`src/futures.rs`、`src/kfeed.rs`）：Kraken Futures 真实行情，杠杆跟 Kraken 一致，逐仓和全仓，单独的合约钱包。合约成交走 `fut_apply_fill`，不碰现货余额；改动后跑 `cargo test` 和冒烟测试，并确认对账无差错（合约钱包、逐仓保证金、挂单冻结都在对账里）。
+- 第二期永续合约（`src/futures.rs`、`src/kfeed.rs`）：Kraken Futures 真实行情，杠杆跟 Kraken 一致，逐仓和全仓，单独的合约钱包。合约成交走 `fut_apply_fill`，不碰现货余额；改动后跑 `cargo test` 和冒烟测试，并确认对账无差错（合约钱包、逐仓保证金、挂单冻结都在对账里）。
