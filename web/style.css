@@ -111,6 +111,14 @@ form.inline input.narrow { flex: 0 0 80px; }
 details { margin-top: 8px; } summary { cursor: pointer; color: var(--muted); }
 td input { padding: 3px 6px; width: 130px; }
 
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 20; padding: 16px; }
+.modal-card { width: 100%; max-width: 380px; display: grid; gap: 10px; }
+.modal-card h3 { margin: 0; text-transform: none; letter-spacing: 0; color: var(--text); font-size: 14px; }
+.modal-input { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+#modal-preview { margin: 0; min-height: 1.3em; }
+#modal-preview b, #modal-body b { font-family: var(--mono); }
+td button.mini { padding: 0 6px; margin-left: 4px; }
+select:disabled { opacity: .55; cursor: not-allowed; }
 #toasts { position: fixed; right: 14px; bottom: 14px; display: grid; gap: 8px; z-index: 10; max-width: min(360px, calc(100vw - 28px)); }
 .toast { background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
 .toast.good { border-left-color: var(--up); } .toast.bad { border-left-color: var(--down); }

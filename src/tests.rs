@@ -541,7 +541,7 @@ fn isolated_long_opens_with_margin_and_closes_with_profit() {
 #[test]
 fn cross_short_flips_to_long_in_one_order() {
     let (mut e, uid) = fut_setup();
-    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("5")).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("5"), T0).unwrap();
     go(&mut e, uid, preq(Side::Sell, OType::Market, "10", None));
     assert_eq!(pos_size(&e, uid), d("-10"));
     assert_eq!(wallet(&e, uid), d("9999.5")); // cross margin stays in the wallet; only the fee left
@@ -569,7 +569,7 @@ fn reduce_only_orders_and_locked_settings() {
     assert!(e.place_order(uid, ro(Side::Sell, "20"), T0).is_err()); // larger than the position
     go(&mut e, uid, ro(Side::Sell, "4"));
     assert_eq!(pos_size(&e, uid), d("6"));
-    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("20")).is_err());
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("20"), T0).is_err());
     assert!(e.place_order(uid, OrderReq { reduce_only: true, ..req(Side::Sell, OType::Market, "0.001", None) }, T0).is_err());
     audit(&e);
 }
@@ -578,10 +578,10 @@ fn reduce_only_orders_and_locked_settings() {
 fn leverage_limits_and_insufficient_margin() {
     let (mut e, uid) = fut_setup();
     for bad in ["101", "0", "2.5"] {
-        assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d(bad)).is_err(), "{bad}");
+        assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d(bad), T0).is_err(), "{bad}");
     }
-    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("100")).unwrap();
-    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1")).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("100"), T0).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1"), T0).unwrap();
     // 1x: 200 contracts at ~100 needs ~20,000 of margin; the wallet has 10,000
     let err = e.place_order(uid, preq(Side::Buy, OType::Limit, "200", Some("100.0")), T0).unwrap_err();
     assert!(err.contains("insufficient futures margin"), "{err}");
@@ -617,7 +617,7 @@ fn resting_perp_limit_order_fills_from_real_trades_as_maker() {
 fn funding_is_paid_by_longs_to_shorts_once_per_period() {
     let (mut e, alice) = fut_setup();
     let bob = new_trader(&mut e, "bob", "10000");
-    e.set_fut_settings(bob, PERP, MarginMode::Cross, d("10")).unwrap();
+    e.set_fut_settings(bob, PERP, MarginMode::Cross, d("10"), T0).unwrap();
     go(&mut e, alice, preq(Side::Buy, OType::Market, "10", None));
     go(&mut e, bob, preq(Side::Sell, OType::Market, "10", None));
     let bob_wallet = wallet(&e, bob);
@@ -659,7 +659,7 @@ fn cross_liquidation_and_bankruptcy_hit_the_insurance_fund() {
     let (mut e, _) = fut_setup();
     // carol: 300 in futures, 50 long at 20x cross (initial margin 250.25)
     let carol = new_trader(&mut e, "carol", "300");
-    e.set_fut_settings(carol, PERP, MarginMode::Cross, d("20")).unwrap();
+    e.set_fut_settings(carol, PERP, MarginMode::Cross, d("20"), T0).unwrap();
     go(&mut e, carol, preq(Side::Buy, OType::Market, "50", None));
     assert_eq!(wallet(&e, carol), d("297.4975"));
     let liq = e.liq_price(&e.positions[&(carol, PERP.to_string())]).unwrap();
@@ -675,7 +675,7 @@ fn cross_liquidation_and_bankruptcy_hit_the_insurance_fund() {
     perp_book(&mut e, "100.0", "100.1");
     perp_mark(&mut e, "100");
     let dave = new_trader(&mut e, "dave", "300");
-    e.set_fut_settings(dave, PERP, MarginMode::Cross, d("20")).unwrap();
+    e.set_fut_settings(dave, PERP, MarginMode::Cross, d("20"), T0).unwrap();
     go(&mut e, dave, preq(Side::Buy, OType::Market, "50", None));
     perp_book(&mut e, "90.0", "90.1");
     perp_mark(&mut e, "90");
@@ -764,5 +764,91 @@ fn partial_close_loss_comes_from_the_rest_of_the_margin_first() {
     // a student's own order with the note "liquidation" is still an ordinary close
     go(&mut e, uid, OrderReq { reduce_only: true, note: Some("liquidation".into()), ..preq(Side::Sell, OType::Market, "5", None) });
     assert_eq!(e.position_history(uid, 1)[0]["reason"], "closed");
+    audit(&e);
+}
+
+#[test]
+fn isolated_leverage_change_resizes_the_margin() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None)); // 10 @ 100.1 at 10x: margin 100.1
+    let margin = |e: &Engine| e.positions[&(uid, PERP.to_string())].margin;
+    let w0 = wallet(&e, uid);
+    // 20x: margin = entry value / 20, half comes back; the liquidation price moves closer
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).unwrap();
+    assert_eq!((margin(&e), wallet(&e, uid)), (d("50.05"), w0 + d("50.05")));
+    let p = e.positions[&(uid, PERP.to_string())].clone();
+    assert_eq!(p.leverage, d("20"));
+    assert_eq!(e.liq_price(&p).unwrap().round_dp(4), d("95.5729"));
+    // 5x: topped up from the wallet
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("5"), T0).unwrap();
+    assert_eq!((margin(&e), wallet(&e, uid)), (d("200.2"), w0 - d("100.1")));
+    audit(&e);
+
+    // 1x would need 800.8 more than the wallet can spare
+    let avail = e.fut_available(uid);
+    e.fut_transfer(uid, avail - d("100"), false, T0).unwrap();
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("1"), T0).is_err());
+    assert_eq!(margin(&e), d("200.2"));
+    // opening orders were reserved at the old leverage and block a change; reduce-only ones do not
+    let o = e.place_order(uid, preq(Side::Buy, OType::Limit, "0.5", Some("95.0")), T0).unwrap();
+    e.activate(o.id, T0);
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("6"), T0).is_err());
+    e.cancel_order(uid, o.id, T0).unwrap();
+    let stop = OrderReq { reduce_only: true, trigger_price: Some(d("90.0")), ..preq(Side::Sell, OType::StopLoss, "10", None) };
+    e.place_order(uid, stop, T0).unwrap();
+    e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("6"), T0).unwrap();
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d("6"), T0).is_err()); // no mode switch with a position
+    // after a loss, releasing margin for 20x would leave the position below initial margin
+    perp_book(&mut e, "92.0", "92.1");
+    perp_mark(&mut e, "92");
+    assert!(e.set_fut_settings(uid, PERP, MarginMode::Isolated, d("20"), T0).is_err());
+    audit(&e);
+}
+
+#[test]
+fn cross_leverage_change_changes_free_margin() {
+    let (mut e, uid) = fut_setup();
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("10"), T0).unwrap();
+    go(&mut e, uid, preq(Side::Sell, OType::Market, "10", None)); // short 10 @ 100.0
+    assert_eq!(e.fut_available(uid), d("9999.5") - d("100"));
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("50"), T0).unwrap();
+    assert_eq!(e.fut_available(uid), d("9999.5") - d("20"));
+    e.fut_transfer(uid, d("9900"), false, T0).unwrap(); // 99.5 left in the wallet
+    for lev in ["2", "5", "10"] {
+        assert!(e.set_fut_settings(uid, PERP, MarginMode::Cross, d(lev), T0).is_err(), "{lev}x");
+    }
+    assert_eq!(e.positions[&(uid, PERP.to_string())].leverage, d("50")); // a refused change leaves it alone
+    e.set_fut_settings(uid, PERP, MarginMode::Cross, d("12"), T0).unwrap();
+    assert_eq!(e.fut_available(uid).round_dp(2), d("16.17")); // 99.5 - 1000/12
+    audit(&e);
+}
+
+#[test]
+fn adding_margin_moves_the_liquidation_price_away() {
+    let (mut e, uid) = fut_setup();
+    go(&mut e, uid, preq(Side::Buy, OType::Market, "10", None)); // liquidation at about 90.54
+    let w0 = wallet(&e, uid);
+    e.adjust_margin(uid, PERP, d("100"), T0).unwrap();
+    let p = e.positions[&(uid, PERP.to_string())].clone();
+    assert_eq!((p.margin, wallet(&e, uid)), (d("200.1"), w0 - d("100")));
+    assert_eq!(e.liq_price(&p).unwrap().round_dp(4), d("80.4925"));
+    // 90.5 would have liquidated it at 10x; with the extra margin it survives
+    perp_book(&mut e, "90.5", "90.6");
+    perp_mark(&mut e, "90.5");
+    e.fut_tick(T0 + 100);
+    assert_eq!(pos_size(&e, uid), d("10"));
+    perp_book(&mut e, "100.0", "100.1");
+    perp_mark(&mut e, "100");
+    // removable: 200.1 margin - 1 unrealised loss - 100 initial margin at 10x
+    assert_eq!(e.margin_removable(&e.positions[&(uid, PERP.to_string())]), d("99.1"));
+    assert!(e.adjust_margin(uid, PERP, d("-99.2"), T0).is_err());
+    e.adjust_margin(uid, PERP, d("-99.1"), T0).unwrap();
+    assert_eq!(e.positions[&(uid, PERP.to_string())].margin, d("101"));
+    assert!(e.adjust_margin(uid, PERP, d("100000"), T0).is_err()); // more than the wallet holds
+    assert!(e.adjust_margin(uid, "ETH-PERP", d("10"), T0).is_err()); // no such position
+    let bob = new_trader(&mut e, "bob", "1000");
+    e.set_fut_settings(bob, PERP, MarginMode::Cross, d("10"), T0).unwrap();
+    go(&mut e, bob, preq(Side::Buy, OType::Market, "1", None));
+    assert!(e.adjust_margin(bob, PERP, d("10"), T0).is_err()); // cross has no margin of its own
     audit(&e);
 }

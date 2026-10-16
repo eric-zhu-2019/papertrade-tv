@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/futures/transfer", post(fut_transfer))
         .route("/api/futures/settings", post(fut_settings))
         .route("/api/futures/close", post(fut_close))
+        .route("/api/futures/margin", post(fut_margin))
         .route("/api/futures/positions", get(fut_positions))
         .route("/api/futures/funding", get(fut_funding))
         .route("/api/admin/users", get(admin_users))
@@ -460,7 +461,16 @@ async fn fut_settings(State(st): State<AppState>, a: Auth, Json(b): Json<Value>)
     let mode = MarginMode::parse(field(&b, "margin_mode")).ok_or_else(|| bad("margin_mode must be isolated or cross"))?;
     let leverage = dec(&b["leverage"]).ok_or_else(|| bad("leverage is required"))?;
     let mut e = st.engine.lock().unwrap();
-    e.set_fut_settings(a.0.id, &symbol, mode, leverage).map_err(bad)?;
+    e.set_fut_settings(a.0.id, &symbol, mode, leverage, now_ms()).map_err(bad)?;
+    Ok(Json(e.fut_account_json(a.0.id)))
+}
+
+/// {"symbol": "BTC-PERP", "amount": "50"}: add margin to an isolated position; a negative amount removes it.
+async fn fut_margin(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
+    let symbol = perp_of(&st, &b)?;
+    let amount = dec(&b["amount"]).ok_or_else(|| bad("amount is required"))?;
+    let mut e = st.engine.lock().unwrap();
+    e.adjust_margin(a.0.id, &symbol, amount, now_ms()).map_err(bad)?;
     Ok(Json(e.fut_account_json(a.0.id)))
 }
 

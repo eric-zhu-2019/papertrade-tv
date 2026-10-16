@@ -75,7 +75,9 @@ docker compose exec papertrade sh -c 'cat /data/papertrade.db' > backup.db
 | 合约 | 1 张 = 1 个币，USD 结算；每个市场一个净持仓（单向持仓），反向下单先减仓，多出的部分反手 |
 | 资金账户 | 单独的合约钱包，从现货划转 USD 进来才能开仓；未实现盈利要平仓后才能转出 |
 | 杠杆 | 跟 Kraken 一致：BTC、ETH、SOL 最高 100 倍，其他 50 倍；仓位越大，Kraken 的保证金档位要求越高，可用杠杆随之降低 |
-| 保证金 | 逐仓（每个仓位单独的保证金，最多亏掉这部分）或全仓（合约钱包里的钱共同担保所有全仓仓位），按市场设置；有仓位或挂单时不能改 |
+| 保证金 | 逐仓（每个仓位单独的保证金，最多亏掉这部分）或全仓（合约钱包里的钱共同担保所有全仓仓位），按市场设置；有仓位或挂单时不能切换模式 |
+| 追加 / 减少保证金 | 只对逐仓：追加让强平价远离；减少后仓位仍要有当前杠杆下的初始保证金（浮动盈利不算） |
+| 持仓调杠杆 | 逐仓：保证金重置为「开仓价值 ÷ 新杠杆」，多退少补，调整后若会立即低于维持保证金则拒绝；全仓：只改变占用的保证金，可用余额不够则拒绝。该市场有开仓或加仓的挂单时要先撤掉（只减仓挂单可以留着） |
 | 手续费 | Kraken Futures 入门费率：挂单 0.02%，吃单 0.05% |
 | 标记价格 | 用 Kraken 的 mark price 计算浮动盈亏、保证金和强平 |
 | 资金费率 | 每小时按 Kraken 当期费率结算：费率为正时多头付给空头，为负时反过来；逐仓从仓位保证金里扣，全仓从钱包里扣 |
@@ -96,7 +98,7 @@ docker compose exec papertrade sh -c 'cat /data/papertrade.db' > backup.db
 
 ## API（给写机器人的学生）
 
-在「账户」页创建 API 密钥，所有请求带 `Authorization: Bearer <key>`。合约下单用同一个 `POST /api/orders`，`symbol` 填 `BTC-PERP`，可加 `reduce_only`；合约账户、划转、杠杆设置、一键平仓、仓位历史和资金费记录在 `/api/futures/*`。订单字段命名参照 Kraken（`limit_price`、`trigger_price`、`time_in_force`、`post_only`），鉴权方式简化为 Bearer 令牌。完整示例在「账户 → API 快速上手」。
+在「账户」页创建 API 密钥，所有请求带 `Authorization: Bearer <key>`。合约下单用同一个 `POST /api/orders`，`symbol` 填 `BTC-PERP`，可加 `reduce_only`；合约账户、划转、杠杆设置、追加保证金、一键平仓、仓位历史和资金费记录在 `/api/futures/*`。订单字段命名参照 Kraken（`limit_price`、`trigger_price`、`time_in_force`、`post_only`），鉴权方式简化为 Bearer 令牌。完整示例在「账户 → API 快速上手」。
 
 | 接口 | 用途 |
 |---|---|
@@ -119,7 +121,7 @@ FEED=sim ADMIN_PASSWORD=adminpass123 INVITE_CODE=test cargo run
 ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # 对运行中的实例做端到端检查
 ```
 
-`smoke_test.py` 只用 Python 标准库，约 5 秒跑完 35 项检查：行情、WebSocket、各类订单与冻结资金、合约（划转、杠杆、逐仓开多、全仓做空、只减仓、平仓）、账号隔离、权限、一次性邀请码、API 密钥、账本对账。只需要 `ADMIN_PASSWORD`。它使用专用账号 `smoke-a` / `smoke-b` / `smoke-c`（首次运行时用自己生成的一次性邀请码注册），结束时卖回持仓并禁用这些账号，所以不会出现在排行榜上。`deploy.sh` 部署完会在服务器上自动运行它（`SMOKE=0 ./deploy.sh` 跳过）。
+`smoke_test.py` 只用 Python 标准库，约 5 秒跑完 36 项检查：行情、WebSocket、各类订单与冻结资金、合约（划转、杠杆、逐仓开多、追加保证金、持仓调杠杆、全仓做空、只减仓、平仓）、账号隔离、权限、一次性邀请码、API 密钥、账本对账。只需要 `ADMIN_PASSWORD`。它使用专用账号 `smoke-a` / `smoke-b` / `smoke-c`（首次运行时用自己生成的一次性邀请码注册），结束时卖回持仓并禁用这些账号，所以不会出现在排行榜上。`deploy.sh` 部署完会在服务器上自动运行它（`SMOKE=0 ./deploy.sh` 跳过）。
 
 | 文件 | 内容 |
 |---|---|

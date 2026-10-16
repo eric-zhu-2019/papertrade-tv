@@ -365,6 +365,9 @@ function updateForm() {
   if (perp) {
     const st = futSettings(sym);
     if (document.activeElement !== form.margin_mode) form.margin_mode.value = st.margin_mode;
+    const locked = !!position(sym);
+    form.margin_mode.disabled = locked;
+    form.margin_mode.title = locked ? t("mode_locked") : "";
     if (document.activeElement !== form.leverage) form.leverage.value = st.leverage;
     form.leverage.max = st.max_leverage;
     $("#max-lev").textContent = `≤ ${st.max_leverage}x`;
@@ -454,14 +457,99 @@ form.addEventListener("submit", async (e) => {
 });
 
 // ---------------------------------------------------------------- futures account
+/// Liquidation price of an isolated position with margin `m` (same formula as the server).
+function isoLiq(p, m) {
+  const q = +p.size, e = +p.entry, mm = +p.value > 0 ? +p.maint_margin / +p.value : 0;
+  const l = p.side === "long" ? (q * e - m) / (q * (1 - mm)) : (q * e + m) / (q * (1 + mm));
+  return l > 0 ? l : null;
+}
 async function saveFutSettings() {
   const err = $("#order-err"); err.textContent = "";
-  try {
-    S.fut = await api("/futures/settings", { method: "POST", body: { symbol: S.symbol, margin_mode: form.margin_mode.value, leverage: Math.round(+form.leverage.value) } });
-    toast(`${S.symbol}: ${t(form.margin_mode.value)} ${Math.round(+form.leverage.value)}x`);
-  } catch (ex) { err.textContent = ex.message; }
+  const sym = S.symbol, mode = form.margin_mode.value, lev = Math.round(+form.leverage.value);
+  const send = async () => {
+    S.fut = await api("/futures/settings", { method: "POST", body: { symbol: sym, margin_mode: mode, leverage: lev } });
+    toast(`${sym}: ${t(mode)} ${lev}x`);
+    refreshSoon();
+  };
   form.margin_mode.blur(); form.leverage.blur();
+  const p = position(sym), old = +futSettings(sym).leverage;
+  if (p && lev !== old && lev >= 1) {
+    // a position changes with the leverage: show what will happen before doing it
+    const value = +p.size * +p.entry;
+    let html, preview;
+    if (p.margin_mode === "isolated") {
+      const m = value / lev, diff = m - +p.margin, liq = isoLiq(p, m);
+      html = `<p class="muted small">${esc(t("lev_iso_hint"))}</p>`;
+      preview = () => `${esc(t("cur_margin"))} <b>$${fmtUsd(p.margin)}</b> → <b>$${fmtUsd(m)}</b> (${diff >= 0 ? esc(t("lev_refill")) : esc(t("lev_release"))} $${fmtUsd(Math.abs(diff))})<br>` +
+        `${esc(t("liq_price"))} <b>${fmtPrice(sym, p.liq_price)}</b> → <b class="down">${liq ? fmtPrice(sym, liq) : "–"}</b>`;
+    } else {
+      html = `<p class="muted small">${esc(t("lev_cross_hint"))}</p>`;
+      preview = () => `${esc(t("margin_tied"))} <b>$${fmtUsd(value / old)}</b> → <b>$${fmtUsd(value / lev)}</b>`;
+    }
+    openModal({ title: `${t("change_lev")} · ${sym} · ${old}x → ${lev}x`, html, preview, ok: send, onCancel: updateForm });
+    return;
+  }
+  try { await send(); } catch (ex) { err.textContent = ex.message; }
   updateForm();
+}
+
+// ---------------------------------------------------------------- modal
+const M = {};
+function openModal({ title, html = "", input = false, max = null, preview = null, ok, okLabel, onCancel = null }) {
+  Object.assign(M, { max, preview, ok, onCancel });
+  $("#modal-title").textContent = title;
+  $("#modal-body").innerHTML = html;
+  $("#modal-input").classList.toggle("hidden", !input);
+  $("#modal-amount").value = "";
+  $("#modal-amount").required = input;
+  $("#modal-max").classList.toggle("hidden", max == null);
+  $("#modal-ok").textContent = okLabel || t("confirm");
+  $("#modal-err").textContent = "";
+  $("#modal-preview").innerHTML = preview ? preview("") : "";
+  $("#modal").classList.remove("hidden");
+  if (input) $("#modal-amount").focus();
+}
+function closeModal(cancelled) {
+  if ($("#modal").classList.contains("hidden")) return;
+  $("#modal").classList.add("hidden");
+  if (cancelled && M.onCancel) M.onCancel();
+  M.ok = null;
+}
+$("#modal-amount").addEventListener("input", () => { if (M.preview) $("#modal-preview").innerHTML = M.preview($("#modal-amount").value.trim()); });
+$("#modal-max").addEventListener("click", () => { $("#modal-amount").value = M.max; $("#modal-amount").dispatchEvent(new Event("input")); });
+$("#modal-cancel").addEventListener("click", () => closeModal(true));
+$("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(true); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(true); });
+$("#modal-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = $("#modal-ok"); btn.disabled = true;
+  try { await M.ok($("#modal-amount").value.trim()); closeModal(false); } catch (ex) { $("#modal-err").textContent = ex.message; }
+  btn.disabled = false;
+});
+
+/// Add (+) or remove (-) margin on an isolated position.
+function marginDialog(sym, add) {
+  const p = position(sym); if (!p || !S.fut) return;
+  const limit = add ? +S.fut.available : +p.margin_removable;
+  const max = String(floorTo(limit, 2));
+  openModal({
+    title: `${t(add ? "add_margin" : "remove_margin")} · ${sym} ${t(p.side)} ${fmtQty(p.size)}`,
+    html: `<div class="fut-stats"><div><span>${esc(t("cur_margin"))}</span><b>$${fmtUsd(p.margin)}</b></div>` +
+      `<div><span>${esc(t("liq_price"))}</span><b class="down">${p.liq_price ? fmtPrice(sym, p.liq_price) : "–"}</b></div>` +
+      `<div><span>${esc(t(add ? "can_add" : "can_remove"))}</span><b>$${fmtUsd(limit)}</b></div></div>`,
+    input: true, max,
+    preview: (v) => {
+      const a = +v; if (!(a > 0)) return "";
+      const m = +p.margin + (add ? a : -a), liq = isoLiq(p, m);
+      return `${esc(t("new_margin"))} <b>$${fmtUsd(m)}</b> · ${esc(t("new_liq"))} <b class="down">${liq ? fmtPrice(sym, liq) : "–"}</b>`;
+    },
+    okLabel: t(add ? "add_margin" : "remove_margin"),
+    ok: async (v) => {
+      S.fut = await api("/futures/margin", { method: "POST", body: { symbol: sym, amount: (add ? "" : "-") + v } });
+      toast(`${sym}: ${t(add ? "add_margin" : "remove_margin")} $${fmtUsd(v)}`, "good");
+      refreshSoon();
+    },
+  });
 }
 form.margin_mode.addEventListener("change", saveFutSettings);
 form.leverage.addEventListener("change", saveFutSettings);
@@ -525,7 +613,8 @@ const TABS = {
     { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
     { h: t("mark_price"), f: (p) => fmtPrice(p.symbol, p.mark) },
     { h: t("liq_price"), f: (p) => (p.liq_price ? `<span class="down">${fmtPrice(p.symbol, p.liq_price)}</span>` : "–") },
-    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode))} ${esc(p.leverage)}x</span>` },
+    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode))} ${esc(p.leverage)}x</span>` +
+      (p.margin_mode === "isolated" ? `<button class="mini" data-addm="${esc(p.symbol)}" title="${esc(t("add_margin"))}">+</button><button class="mini" data-subm="${esc(p.symbol)}" title="${esc(t("remove_margin"))}">−</button>` : "") },
     { h: t("pnl"), f: (p) => `<span class="${cls(+p.unrealized_pnl)}">${signUsd(p.unrealized_pnl)} (${pct(+p.roe_pct)})</span>` },
     { h: t("funding"), f: (p) => `<span class="${cls(+p.funding)}">${signUsd(p.funding)}</span>` },
     { h: "", f: (p) => `<button data-close="${esc(p.symbol)}">${esc(t("close_pos"))}</button>` },
@@ -575,6 +664,8 @@ let closeArmed = null;
 $("#tab-table").addEventListener("click", async (e) => {
   const go = e.target.dataset.go;
   if (go) { e.preventDefault(); return selectSymbol(go); }
+  if (e.target.dataset.addm) return marginDialog(e.target.dataset.addm, true);
+  if (e.target.dataset.subm) return marginDialog(e.target.dataset.subm, false);
   const sym = e.target.dataset.close;
   if (sym) {
     // closing at market is not undoable: ask for a second click
@@ -693,9 +784,11 @@ GET    /api/tickers | /api/instruments | /api/trades?symbol= | /api/candles?symb
 # Perpetual futures (symbols like BTC-PERP; a separate USD wallet; 1 contract = 1 coin)
 POST /api/futures/transfer  {"amount":"1000","to":"futures"|"spot"}
 POST /api/futures/settings  {"symbol":"BTC-PERP","margin_mode":"isolated"|"cross","leverage":10}
+                            (leverage can change with a position open; isolated margin is reset to entry value / leverage)
 GET  /api/futures/account   wallet, available margin, positions with liquidation prices
 POST /api/orders            same as spot, with "symbol":"BTC-PERP" and optional "reduce_only":true
 POST /api/futures/close     {"symbol":"BTC-PERP"}   market-close the whole position
+POST /api/futures/margin    {"symbol":"BTC-PERP","amount":"50"}   add isolated margin (negative removes)
 GET  /api/futures/positions | /api/futures/funding   closed positions, funding payments
 
 # Live stream: connect to ${o.replace(/^http/, "ws")}/ws and send

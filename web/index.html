@@ -229,6 +229,22 @@
   </footer>
 </section>
 
+<div id="modal" class="modal hidden">
+  <form id="modal-form" class="modal-card panel">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div id="modal-input" class="modal-input">
+      <input id="modal-amount" inputmode="decimal" autocomplete="off" data-tp="amount">
+      <button type="button" id="modal-max" class="link">Max</button>
+    </div>
+    <p class="small" id="modal-preview"></p>
+    <div class="row2">
+      <button type="button" id="modal-cancel" data-t="dismiss"></button>
+      <button class="primary" id="modal-ok"></button>
+    </div>
+    <p class="err" id="modal-err"></p>
+  </form>
+</div>
 <div id="toasts"></div>
 <script src="/lightweight-charts.js"></script>
 <script src="/i18n.js"></script>
