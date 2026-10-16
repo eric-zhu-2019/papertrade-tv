@@ -512,13 +512,18 @@ function openModal({ title, html = "", input = false, max = null, preview = null
   $("#modal-ok").textContent = okLabel || t("confirm");
   $("#modal-err").textContent = "";
   $("#modal-preview").innerHTML = preview ? preview("") : "";
+  // the page behind is out of reach (mouse, Tab, Enter, screen readers) until the dialog closes
+  M.returnFocus = document.activeElement;
+  for (const id of ["#app", "#auth"]) $(id).inert = true;
   $("#modal").classList.remove("hidden");
-  if (input) $("#modal-amount").focus();
+  (input ? $("#modal-amount") : $("#modal-ok")).focus();
 }
 function closeModal(cancelled) {
   if ($("#modal").classList.contains("hidden")) return;
   if (cancelled && M.busy) return; // the request is already on its way; wait for its answer
   $("#modal").classList.add("hidden");
+  for (const id of ["#app", "#auth"]) $(id).inert = false;
+  if (M.returnFocus && M.returnFocus.isConnected && M.returnFocus !== document.body) M.returnFocus.focus();
   if (cancelled && M.onCancel) M.onCancel();
   M.ok = null;
 }
@@ -573,6 +578,12 @@ function marginDialog(sym, add) {
 }
 form.margin_mode.addEventListener("change", saveFutSettings);
 form.leverage.addEventListener("change", queueFutSettings);
+// Enter in the leverage box applies the leverage; it must not also submit the order form
+form.leverage.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  saveFutSettings();
+});
 
 function renderFutPanel() {
   const a = S.fut; if (!a) return;
