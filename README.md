@@ -146,3 +146,7 @@ ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # 对运行中的实例做�
 | `web/` | 前端（中英双语） |
 
 K 线图使用 [TradingView Lightweight Charts™](https://www.tradingview.com/)（Apache-2.0）。
+
+## 许可证
+
+本项目以 [Apache License 2.0](LICENSE) 发布。
