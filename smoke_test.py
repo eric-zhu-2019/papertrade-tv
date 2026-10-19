@@ -75,6 +75,8 @@ class Client:
     def call(self, method, path, body=None, token=None):
         tok = token or self.token
         req = urllib.request.Request(self.base + path, method=method)
+        # Cloudflare (when the exchange is served through it) blocks urllib's default User-Agent
+        req.add_header("User-Agent", "papertrade-smoke/1.0")
         if tok:
             req.add_header("Authorization", f"Bearer {tok}")
         data = None
@@ -124,7 +126,7 @@ class WS:
         key = base64.b64encode(os.urandom(16)).decode()
         sock.sendall(
             (
-                f"GET /ws HTTP/1.1\r\nHost: {u.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"GET /ws HTTP/1.1\r\nHost: {u.netloc}\r\nUser-Agent: papertrade-smoke/1.0\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
             ).encode()
         )

@@ -49,6 +49,10 @@ location / {
 
 If nginx also runs in Docker, put both containers on one Docker network and point `proxy_pass` at `http://papertrade:8080`.
 
+### Cloudflare Tunnel
+
+Instead of nginx, a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) gives a public HTTPS hostname with no open ports; WebSockets work through it unchanged. Point its ingress at `http://localhost:8080`. Cloudflare's Browser Integrity Check blocks Python's default `urllib` User-Agent (error 1010), so bots must send their own `User-Agent` header (`smoke_test.py` and `bots/trend_bot.py` do); `requests` and curl are not affected.
+
 ### Backups
 
 All data lives in one SQLite file in the Docker volume `papertrade-data`. Back it up at least before each season reset:

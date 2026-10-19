@@ -49,6 +49,10 @@ location / {
 
 如果 nginx 也跑在 Docker 里，把两者放进同一个 Docker 网络，`proxy_pass` 指向 `http://papertrade:8080`。
 
+### Cloudflare Tunnel
+
+也可以不用 nginx，改用 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)：不用开放端口就能得到一个公网 HTTPS 域名，WebSocket 照常可用。把隧道的 ingress 指向 `http://localhost:8080` 即可。Cloudflare 的浏览器完整性检查会拦截 Python `urllib` 默认的 User-Agent（错误 1010），所以机器人要自己带 `User-Agent` 请求头（`smoke_test.py` 和 `bots/trend_bot.py` 已经带了）；`requests` 和 curl 不受影响。
+
 ### 备份
 
 所有数据在 Docker 卷 `papertrade-data` 里的一个 SQLite 文件中。建议在赛季重置前备份一次：

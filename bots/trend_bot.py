@@ -79,7 +79,10 @@ def api(method, path, body=None):
     """(status, json). GETs retry through a server restart; orders are never sent twice."""
     for attempt in range(6):
         req = urllib.request.Request(
-            BASE + path, method=method, headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
+            BASE + path,
+            method=method,
+            # Cloudflare (when the exchange is served through it) blocks urllib's default User-Agent
+            headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json", "User-Agent": "papertrade-bot/1.0"},
         )
         try:
             with urllib.request.urlopen(req, json.dumps(body).encode() if body is not None else None, timeout=15) as r:
