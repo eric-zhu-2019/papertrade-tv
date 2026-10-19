@@ -319,6 +319,57 @@ function renderOrderLines() {
       add(o.limit_price, false, `${t(o.side)} ${left}`);
     }
   }
+  // the order picked in the orders table, highlighted
+  const sel = S.selOrder, px = selOrderPrice();
+  if (sel && sel.symbol === S.symbol && px) {
+    S.orderLines.push(S.series.createPriceLine({
+      price: px, color: "#e8b339", lineWidth: 2, lineStyle: 0, axisLabelVisible: true,
+      title: `#${sel.id} ${t(sel.side)} ${fmtQty(sel.qty)}`,
+    }));
+  }
+}
+/// Where the selected order sits on the chart: its fill price once filled, else its limit or trigger.
+function selOrderPrice() {
+  const o = S.selOrder;
+  return o ? +(o.avg_price || o.limit_price || o.trigger_price || 0) || null : null;
+}
+/// Pick (or un-pick) an order row; its line stays until the orders table is left.
+function selectOrder(o) {
+  S.selOrder = o && (!S.selOrder || S.selOrder.id !== o.id) ? o : null;
+  if (S.selOrder && S.selOrder.symbol !== S.symbol) selectSymbol(S.selOrder.symbol);
+  renderTab(); renderOrderLines();
+  if (S.series) S.chart.priceScale("right").applyOptions({ autoScale: true });
+  if (!focusSelOrder()) showLatest();
+}
+function clearSelOrder() {
+  if (!S.selOrder) return;
+  S.selOrder = null;
+  renderOrderLines();
+  focusSelOrder(); showLatest();
+}
+/// Scroll the chart to the selected order's lifetime and mark when it was placed and when it ended.
+/// Returns false (and clears the markers) when there is nothing to show.
+function focusSelOrder() {
+  const o = S.selOrder, c = S.candles || [];
+  if (!S.series) return false;
+  if (!o || o.symbol !== S.symbol || !c.length) { S.series.setMarkers([]); return false; }
+  const span = S.interval * 60, bar = (ms) => Math.floor(ms / 1000 / span) * span + TZ;
+  // index of the candle holding a timestamp (clamped to the loaded range)
+  const idx = (ms) => { const b = bar(ms), i = c.findIndex((k) => k.time >= b); return i < 0 ? c.length - 1 : i; };
+  const done = !["pending", "open", "untriggered"].includes(o.status);
+  const i0 = idx(o.created_ms), i1 = done ? idx(o.updated_ms || o.created_ms) : c.length - 1;
+  const color = o.side === "buy" ? "#2fbf8f" : "#f0616d", below = o.side === "buy";
+  const marks = [{ time: c[i0].time, position: below ? "belowBar" : "aboveBar", color: "#e8b339", shape: below ? "arrowUp" : "arrowDown", text: `#${o.id}` }];
+  if (done && +o.filled > 0 && i1 !== i0) marks.push({ time: c[i1].time, position: below ? "belowBar" : "aboveBar", color, shape: "circle", text: t("s_" + o.status) });
+  S.series.setMarkers(marks);
+  // centre the order's lifetime, but don't scroll past the newest candle
+  const half = Math.max(70, (i1 - i0) / 2 + 20), to = Math.min((i0 + i1) / 2 + half, c.length + 4);
+  S.chart.timeScale().setVisibleLogicalRange({ from: to - 2 * half, to });
+  return true;
+}
+function showLatest() {
+  const n = (S.candles || []).length;
+  if (S.series && n) S.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 140), to: n + 4 });
 }
 
 function initChart() {
@@ -329,7 +380,8 @@ function initChart() {
     autoscaleInfoProvider: (base) => {
       const r = base();
       if (!r || !r.priceRange) return r;
-      for (const o of S.orders || []) {
+      const sel = S.selOrder && S.selOrder.symbol === S.symbol ? [{ symbol: S.symbol, limit_price: selOrderPrice() }] : [];
+      for (const o of [...(S.orders || []), ...sel]) {
         if (o.symbol !== S.symbol) continue;
         for (const p of [o.limit_price, o.trigger_price]) {
           if (!p) continue;
@@ -350,8 +402,7 @@ async function loadCandles() {
   S.series.applyOptions({ priceFormat: { type: "price", precision: inst.price_precision, minMove: +inst.price_increment } });
   S.candles = r.candles.map((c) => ({ time: c[0] + TZ, open: +c[1], high: +c[2], low: +c[3], close: +c[4] }));
   S.series.setData(S.candles);
-  const n = S.candles.length;
-  S.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 140), to: n + 4 });
+  if (!focusSelOrder()) showLatest();
 }
 function chartTrade(tr) {
   const span = S.interval * 60, b = Math.floor(tr.ts / 1000 / span) * span + TZ, p = +tr.price;
@@ -728,18 +779,28 @@ async function loadTab() {
   $("#pos-count").textContent = S.fut && S.fut.positions.length ? S.fut.positions.length : "";
 }
 function renderTab() {
-  table($("#tab-table"), TABS[S.tab].cols(), tabRows);
+  const orderTab = S.tab === "open" || S.tab === "history";
+  table($("#tab-table"), TABS[S.tab].cols(), tabRows, orderTab ? {
+    rowId: (o) => o.id,
+    rowClass: (o) => "clickable" + (S.selOrder && S.selOrder.id === o.id ? " sel" : ""),
+  } : {});
   if (S.tab === "open") $("#open-count").textContent = tabRows.length || "";
   $("#cancel-all").classList.toggle("hidden", S.tab !== "open" || !tabRows.length);
 }
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("[data-tab]"); if (!b) return;
+  if (b.dataset.tab !== S.tab) clearSelOrder();
   S.tab = b.dataset.tab; tabRows = [];
   $$("#tabs [data-tab]").forEach((x) => x.classList.toggle("on", x === b));
   renderTab(); loadTab();
 });
 let closeArmed = null;
 $("#tab-table").addEventListener("click", async (e) => {
+  if ((S.tab === "open" || S.tab === "history") && !e.target.closest("button, a")) {
+    const tr = e.target.closest("tr[data-id]");
+    const o = tr && tabRows.find((x) => String(x.id) === tr.dataset.id);
+    if (o) return selectOrder(o);
+  }
   const go = e.target.dataset.go;
   if (go) { e.preventDefault(); return selectSymbol(go); }
   if (e.target.dataset.addm) return marginDialog(e.target.dataset.addm, true);
@@ -774,6 +835,7 @@ setInterval(() => { if (S.me && !document.hidden) { refresh(); if (S.view === "b
 // ---------------------------------------------------------------- views
 $("#nav").addEventListener("click", (e) => {
   const v = e.target.dataset.view; if (!v) return;
+  if (v !== "trade") clearSelOrder();
   S.view = v;
   $$("#nav button").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
   $$(".view").forEach((m) => m.classList.toggle("hidden", m.id !== "view-" + v));
