@@ -92,6 +92,8 @@ td button { padding: 2px 8px; font-family: inherit; }
 /* order form */
 .side-seg { display: flex; margin-bottom: 10px; } .side-seg button { flex: 1; padding: 7px; font-weight: 700; }
 .side-seg button.on.buy { background: var(--up); color: #04261b; } .side-seg button.on.sell { background: var(--down); color: #2b0509; }
+.act-seg { display: flex; margin-bottom: 8px; } .act-seg button { flex: 1; }
+.side-seg.closing { flex-direction: row-reverse; }
 .pcts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin: -3px 0 10px; } .pcts button { padding: 3px; font-size: 12px; color: var(--muted); }
 .qty-head { display: flex; align-items: center; justify-content: space-between; }
 .unit-seg { display: inline-flex; } .unit-seg button { padding: 0 7px; font-size: 11px; line-height: 18px; color: var(--muted); border-radius: 0; }

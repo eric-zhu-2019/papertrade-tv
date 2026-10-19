@@ -13,7 +13,7 @@ const S = {
   me: null, cfg: null, inst: {}, tickers: {}, feedOk: true, futFeedOk: true, side: "buy", tab: "open", view: "trade",
   fut: null, // futures account: wallet, positions, settings
   book: { bids: [], asks: [] }, tape: [], candles: [], portfolio: null,
-  sort: { key: "return_pct", dir: -1 }, board: null, boardSel: null, authMode: "login", qtyUnit: store.get("pt_qty_unit") === "usd" ? "usd" : "coin", qtyExact: null,
+  sort: { key: "return_pct", dir: -1 }, board: null, boardSel: null, authMode: "login", qtyUnit: store.get("pt_qty_unit") === "usd" ? "usd" : "coin", qtyExact: null, futAct: "open",
 };
 
 // ---------------------------------------------------------------- helpers
@@ -449,14 +449,20 @@ function updateForm() {
   coinBtn.textContent = base(sym); usdBtn.textContent = S.cfg.quote;
   coinBtn.title = t("qty_coin"); usdBtn.title = t("qty_in_usd");
   coinBtn.classList.toggle("on", !qtyInUsd()); usdBtn.classList.toggle("on", qtyInUsd());
-  $("#row-margin").classList.toggle("hidden", !perp);
-  $("#row-reduce").classList.toggle("hidden", !perp);
+  $("#row-margin").classList.toggle("hidden", !perp || S.futAct === "close");
   $("#fut-panel").classList.toggle("hidden", !perp);
   const btn = $("#submit-order");
-  const [buyLbl, sellLbl] = perp ? [t("buy_long"), t("sell_short")] : [t("buy"), t("sell")];
+  // perps: an Open / Close tab. Open is Long / Short; Close is Close long / Close short and reduce-only
+  const closing = perp && S.futAct === "close";
+  form.reduce_only.checked = closing;
+  $("#act-seg").classList.toggle("hidden", !perp);
+  $$("#act-seg button").forEach((b) => b.classList.toggle("on", b.dataset.act === (closing ? "close" : "open")));
+  $("#side-seg").classList.toggle("closing", closing); // Close long (a sell) goes first
+  $("#row-reduce").classList.add("hidden");
+  const [buyLbl, sellLbl] = !perp ? [t("buy"), t("sell")] : closing ? [t("close_short"), t("close_long")] : [t("open_long"), t("open_short")];
   $('#side-seg [data-side="buy"]').textContent = buyLbl;
   $('#side-seg [data-side="sell"]').textContent = sellLbl;
-  const reduce = perp && form.reduce_only.checked;
+  const reduce = closing;
   btn.textContent = perp
     ? `${t(reduce ? (S.side === "buy" ? "close_short" : "close_long") : S.side === "buy" ? "open_long" : "open_short")} ${base(sym)}`
     : `${t(S.side)} ${base(sym)}`;
@@ -471,7 +477,10 @@ function updateForm() {
     if (document.activeElement !== form.leverage) form.leverage.value = st.leverage;
     form.leverage.max = st.max_leverage;
     $("#max-lev").textContent = `≤ ${st.max_leverage}x`;
-    $("#avail").textContent = `${t("fut_avail")}: ${S.fut ? fmtUsd(S.fut.available) : "–"} ${S.cfg.quote}`;
+    const pos = closablePos();
+    $("#avail").textContent = closing
+      ? `${t("closable")}: ${pos ? fmtQty(pos.size) : 0} ${base(sym)}`
+      : `${t("fut_avail")}: ${S.fut ? fmtUsd(S.fut.available) : "–"} ${S.cfg.quote}`;
     renderFutPanel();
   } else {
     const asset = S.side === "buy" ? S.cfg.quote : base(sym);
@@ -522,14 +531,14 @@ $("#qty-unit").addEventListener("click", (e) => {
   const u = e.target.dataset.u; if (!u || u === S.qtyUnit) return;
   e.preventDefault();
   // carry the current amount over into the other unit
-  const v = +form.qty.value, px = form.type.value === "market" ? (v > 0 && !qtyInUsd() ? walkBook(v) : refPrice()) : refPrice();
-  if (v > 0 && px) form.qty.value = u === "usd" ? String(floorTo(v * px, 2)) : String(orderQty() ?? "");
-  S.qtyExact = null;
+  const v = form.qty.value.trim(), coins = orderQty();
   S.qtyUnit = u; store.set("pt_qty_unit", u);
-  updateForm();
+  if (u === "coin") { form.qty.value = +v > 0 ? coins ?? "" : v; S.qtyExact = null; updateForm(); }
+  else { updateForm(); if (+v > 0) setPctQty(v); }
 });
 function updateEstimate() {
   const q = orderQty(), qty = +q, type = form.type.value, el = $("#est");
+  if (isPerp(S.symbol) && S.futAct === "close" && !closablePos()) { el.textContent = t("no_pos_to_close"); return; }
   const minQ = +((S.inst[S.symbol] || {}).qty_min || 0);
   if (qtyInUsd() && +form.qty.value > 0 && q != null && !(qty > 0 && qty >= minQ)) { el.textContent = `${t("qty_too_small")} (${fmtQty(minQ)} ${base(S.symbol)})`; return; }
   if (!(qty > 0)) { el.textContent = ""; return; }
@@ -540,15 +549,42 @@ function updateEstimate() {
   const slip = (type === "market" ? ` · ${t("est_slip")} ${fmtPrice(S.symbol, px)}` : "") + (qtyInUsd() ? ` · ≈ ${fmtQty(q)} ${base(S.symbol)}` : "");
   if (isPerp(S.symbol)) {
     const fee = cost * +(maker ? S.cfg.fut_maker_fee : S.cfg.fut_taker_fee);
-    const margin = form.reduce_only.checked ? 0 : cost / Math.max(1, +form.leverage.value || 1);
-    el.textContent = `${t("value")} $${fmtUsd(cost)} · ${t("est_margin")} ≈ $${fmtUsd(margin)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
+    const margin = form.reduce_only.checked ? "" : ` · ${t("est_margin")} ≈ $${fmtUsd(cost / Math.max(1, +form.leverage.value || 1))}`;
+    el.textContent = `${t("value")} $${fmtUsd(cost)}${margin} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
     return;
   }
   const fee = cost * +(maker ? S.cfg.maker_fee : S.cfg.taker_fee);
   el.textContent = `${t("est_cost")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
 }
 form.addEventListener("input", (e) => { if (e.target !== form.qty) S.qtyExact = null; updateForm(); });
-$("#side-seg").addEventListener("click", (e) => { if (e.target.dataset.side) { S.side = e.target.dataset.side; updateForm(); } });
+$("#side-seg").addEventListener("click", (e) => {
+  if (!e.target.dataset.side) return;
+  S.side = e.target.dataset.side;
+  if (isPerp(S.symbol) && S.futAct === "close") return fillClose();
+  updateForm();
+});
+/// The position the Close tab would reduce: a long for Close long (a sell), a short for Close short.
+function closablePos() {
+  const p = position(S.symbol);
+  return p && p.side === (S.side === "sell" ? "long" : "short") ? p : null;
+}
+/// Close tab: pick the side that closes the open position and fill in its whole size.
+function fillClose() {
+  updateForm();
+  const p = closablePos();
+  if (p) setPctQty(p.size); else { form.qty.value = ""; S.qtyExact = null; updateEstimate(); }
+}
+$("#act-seg").addEventListener("click", (e) => {
+  const a = e.target.dataset.act; if (!a || a === S.futAct) return;
+  S.futAct = a;
+  if (a === "close") {
+    const p = position(S.symbol);
+    if (p) S.side = p.side === "long" ? "sell" : "buy";
+    return fillClose();
+  }
+  form.qty.value = ""; S.qtyExact = null;
+  updateForm();
+});
 $("#pcts").addEventListener("click", (e) => {
   const p = +e.target.dataset.p; if (!p) return;
   const inst = S.inst[S.symbol]; if (!inst) return;
@@ -556,7 +592,7 @@ $("#pcts").addEventListener("click", (e) => {
   let q;
   if (isPerp(S.symbol)) {
     const pos = position(S.symbol);
-    if (form.reduce_only.checked) q = pos ? +pos.size * p : 0;
+    if (form.reduce_only.checked) { const c = closablePos(); q = c ? +c.size * p : 0; if (c && p === 1) return setPctQty(c.size); }
     else {
       let px = refPrice(); if (!px || !S.fut) return;
       if (form.type.value === "market") px *= 1.003;
@@ -579,7 +615,8 @@ function setPctQty(q) {
   S.qtyExact = null;
   if (!qtyInUsd()) form.qty.value = q;
   else {
-    const px = form.type.value === "market" ? walkBook(+q) || refPrice() : refPrice();
+    // no limit / trigger price typed yet: show the value at the last price; the exact coins still go out
+    const px = (form.type.value === "market" ? walkBook(+q) : refPrice()) || +(S.tickers[S.symbol] || {}).last || null;
     form.qty.value = px ? String(floorTo(+q * px, 2)) : "";
     S.qtyExact = { usd: form.qty.value, qty: q, symbol: S.symbol, side: S.side, type: form.type.value };
   }
