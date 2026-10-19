@@ -6,7 +6,7 @@
 URL 默认 http://127.0.0.1:8080。只需要管理员密码 ADMIN_PASSWORD（ADMIN_USER 默认 admin），
 从环境变量或 --env-file 读取。只用 Python 标准库。
 
-测试使用专用账号 smoke-a / smoke-b（交易）和 smoke-c（一次性邀请码）：首次运行时用管理员现生成的
+测试覆盖现货、现货做空（杠杆）、永续合约和账号权限。测试使用专用账号 smoke-a / smoke-b（交易）和 smoke-c（一次性邀请码）：首次运行时用管理员现生成的
 一次性邀请码注册，之后由管理员重置密码并启用；结束时撤单、卖回持仓并禁用，所以它们不会出现在
 排行榜上。每次运行只花掉几美分手续费。
 退出码：0 全部通过，1 有检查失败，2 无法开始（连不上、缺配置）。
@@ -593,6 +593,43 @@ class Run:
 
         self.check("市价卖出：持仓卖回", market_sell)
 
+    # ---- spot margin (shorting)
+
+    def margin(self):
+        base = self.symbol.split("/")[0]
+
+        def short_and_close():
+            m = self.a.get("/api/margin")
+            rule = m["rules"][self.symbol]
+            if D(rule["max_short"]) < 2:
+                return f"Kraken 不提供 {self.symbol} 的杠杆做空，跳过"
+            expect(not any(p["symbol"] == self.symbol for p in m["positions"]), "测试前已有杠杆仓位")
+            bid, _ = self.quote()
+            qty = self.small_qty(bid)
+            coins0, _, _ = self.balance(self.a, base)
+            o = self.place(self.a, side="sell", type="market", qty=qty, leverage=2, note="smoke margin short")
+            o = self.settle(self.a, o["id"], until=("filled", "canceled", "rejected"))
+            expect(o["status"] == "filled", f"杠杆卖单状态 {o['status']}：{o.get('reason')}")
+            m = self.a.get("/api/margin")
+            p = next((p for p in m["positions"] if p["symbol"] == self.symbol), None)
+            expect(p and p["side"] == "short" and D(p["size"]) == qty, f"杠杆仓位不对：{p}")
+            expect(abs(D(p["margin"]) - D(p["entry"]) * qty / 2) < Decimal("0.01"), f"保证金 {p['margin']} 应为开仓价值的一半")
+            expect(p["liq_price"] and D(p["liq_price"]) > D(p["entry"]), f"空单强平价 {p['liq_price']} 应高于开仓价")
+            coins1, _, _ = self.balance(self.a, base)
+            expect(coins1 == coins0, f"做空不应动用 {base} 余额（{coins0} → {coins1}）")
+            usd = next(x for x in self.a.get("/api/portfolio")["assets"] if x["asset"] == "USD")
+            expect(D(usd["available"]) <= D(usd["total"]) - D(p["margin"]), "保证金没有从可用 USD 中扣出")
+            # a short close is reduce-only and needs no new margin
+            c = self.a.post("/api/margin/close", {"symbol": self.symbol})["order"]
+            c = self.settle(self.a, c["id"], until=("filled", "canceled", "rejected"))
+            expect(c["status"] == "filled", f"平仓单状态 {c['status']}：{c.get('reason')}")
+            m = self.a.get("/api/margin")
+            expect(not m["positions"], f"平仓后仍有杠杆仓位：{m['positions']}")
+            h = self.a.get("/api/margin/positions?limit=1")["positions"][0]
+            return f"空 {fmt(qty)} {base} @ {fmt(D(p['entry']))}，2x 保证金 {fmt(D(p['margin']))}；平仓净盈亏 {fmt(D(h['net_pnl']))}"
+
+        self.check("现货做空（2x 杠杆）：开仓、保证金冻结、平仓", short_and_close)
+
     # ---- perpetual futures
 
     def futures(self):
@@ -834,6 +871,15 @@ class Run:
             if self.a and self.b:
                 for c in (self.a, self.b):
                     c.delete("/api/orders")
+                    # spot margin positions left over from an interrupted run
+                    m = c.get("/api/margin")
+                    for p in m["positions"]:
+                        c.call("POST", "/api/margin/close", {"symbol": p["symbol"]})
+                        done.append(f"平掉剩余杠杆仓位 {p['symbol']}")
+                    deadline = time.time() + 5
+                    while m["positions"] and time.time() < deadline:
+                        time.sleep(0.2)
+                        m = c.get("/api/margin")
                     # futures left over from an interrupted run: close positions, move the USD back
                     if self.cfg.get("perps"):
                         acct = c.get("/api/futures/account")
@@ -906,6 +952,7 @@ def main():
             return 2
         if run.market_data():
             run.trading()
+            run.margin()
             run.futures()
         run.accounts()
     finally:

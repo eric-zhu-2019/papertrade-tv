@@ -154,8 +154,16 @@ pub async fn run_kraken(engine: Shared, cfg: Arc<Config>) {
     let mut verify = cfg.checksum != "off";
     let mut quick_checksum_failures = 0;
     let mut backoff = 1u64;
+    let http = reqwest::Client::new();
     loop {
         let started = Instant::now();
+        match fetch_margin_rules(&http).await {
+            Ok((pairs, assets)) => {
+                let n = apply_margin_rules(&mut engine.lock().unwrap(), &pairs, &assets);
+                tracing::info!("kraken: loaded margin rules for {n} pairs");
+            }
+            Err(e) => tracing::warn!("kraken margin rules: {e}; using the defaults"),
+        }
         let err = kraken_session(&engine, &cfg, verify).await.unwrap_err();
         {
             let mut e = engine.lock().unwrap();
@@ -178,6 +186,72 @@ pub async fn run_kraken(engine: Shared, cfg: Arc<Config>) {
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
+}
+
+async fn fetch_margin_rules(http: &reqwest::Client) -> Result<(Value, Value), String> {
+    let get = |path: &'static str| async move {
+        let v: Value = http
+            .get(format!("{KRAKEN_REST}/0/public/{path}"))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        if v["error"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            return Err(format!("{path}: {}", v["error"]));
+        }
+        Ok::<Value, String>(v["result"].clone())
+    };
+    Ok((get("AssetPairs").await?, get("Assets").await?))
+}
+
+/// Kraken's name for an asset ("BTC" -> "XBT", "DOGE" -> "XDG").
+fn kraken_asset(a: &str) -> &str {
+    match a {
+        "BTC" => "XBT",
+        "DOGE" => "XDG",
+        _ => a,
+    }
+}
+
+/// Spot margin rules from Kraken's AssetPairs (maximum leverage, margin call and stop levels) and
+/// Assets (each currency's margin rate, charged when opening and at every rollover). Returns how many pairs were set.
+pub fn apply_margin_rules(eng: &mut Engine, pairs: &Value, assets: &Value) -> usize {
+    let rate_of = |asset: &str| -> Option<Decimal> {
+        let a = assets.as_object()?.values().find(|v| v["altname"].as_str() == Some(asset))?;
+        Some(dec(&a["margin_rate"])? / Decimal::ONE_HUNDRED)
+    };
+    let quote = eng.cfg.quote.clone();
+    let mut n = 0;
+    for sym in eng.cfg.symbols.clone() {
+        let base = sym.split('/').next().unwrap_or("").to_string();
+        let ws = format!("{}/{}", kraken_asset(&base), quote);
+        let Some(p) = pairs.as_object().and_then(|m| m.values().find(|v| v["wsname"].as_str() == Some(ws.as_str()))) else {
+            continue;
+        };
+        let max = |k: &str| p[k].as_array().and_then(|a| a.iter().filter_map(|x| x.as_i64()).max()).map(Decimal::from);
+        // no leverage listed: Kraken offers no margin on this pair (and neither do we)
+        let mut r = crate::margin::MarginRule::default_for(&base);
+        r.max_long = max("leverage_buy").unwrap_or(Decimal::ONE);
+        r.max_short = max("leverage_sell").unwrap_or(Decimal::ONE);
+        if let Some(x) = rate_of(&quote) {
+            r.long_rate = x;
+        }
+        if let Some(x) = rate_of(kraken_asset(&base)) {
+            r.short_rate = x;
+        }
+        if let Some(x) = dec(&p["margin_call"]) {
+            r.call_level = x / Decimal::ONE_HUNDRED;
+        }
+        if let Some(x) = dec(&p["margin_stop"]) {
+            r.stop_level = x / Decimal::ONE_HUNDRED;
+        }
+        eng.margin_rules.insert(sym, r);
+        n += 1;
+    }
+    n
 }
 
 /// Historical candles from Kraken's public REST API.

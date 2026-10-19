@@ -36,6 +36,8 @@ pub struct Config {
     pub fut_default_leverage: Decimal,
     /// FEED=sim only: seconds between simulated funding payments.
     pub sim_funding_secs: i64,
+    /// Spot margin: seconds between rollover fees (Kraken: every 4 hours).
+    pub margin_rollover_secs: i64,
 }
 
 fn var(k: &str, default: &str) -> String {
@@ -96,6 +98,7 @@ impl Config {
             liq_fee: dec("LIQ_FEE", "0.005"),
             fut_default_leverage: dec("FUT_DEFAULT_LEVERAGE", "10"),
             sim_funding_secs: var("SIM_FUNDING_SECS", "3600").parse().expect("SIM_FUNDING_SECS"),
+            margin_rollover_secs: var("MARGIN_ROLLOVER_SECS", "14400").parse().expect("MARGIN_ROLLOVER_SECS"),
         }
     }
 

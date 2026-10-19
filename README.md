@@ -4,7 +4,7 @@ English | [中文](README.zh-CN.md)
 
 Real market data (Kraken's public feeds) with pretend money. Students' orders never go to a real exchange: this server simulates their fills against Kraken's live order books and trade stream. No exchange account or API key is needed.
 
-Two kinds of market: 8 spot pairs (BTC/USD and others) and the matching 8 perpetual futures (BTC-PERP and others, priced from Kraken Futures). Perps can be shorted and leveraged, and have funding and liquidation.
+Two kinds of market: 8 spot pairs (BTC/USD and others) and the matching 8 perpetual futures (BTC-PERP and others, priced from Kraken Futures). Spot pairs can also be traded on margin, as on Kraken, to go long or short with leverage. Perps can be shorted and leveraged, and have funding and liquidation.
 
 The backend is Rust (axum + tokio + SQLite); the frontend is a static page with no build step. The whole thing is one binary plus a `web/` directory.
 
@@ -76,6 +76,20 @@ Every book update is checked against Kraken's CRC32 checksum, and the book resyn
 
 **Built-in limits of the simulation**: students' orders don't move the real price, and there is no real counterparty queued behind them. With a $100,000 starting balance on major coins the error is small; the bigger the balances and the thinner the market, the more optimistic the results.
 
+## Spot margin (shorting)
+
+Like Kraken's margin trading: a spot order with `leverage` (2x and up) opens a position on that pair instead of moving coins, so a margin sell is a short without owning the coin. The order matches against the same real book as any spot order.
+
+| Topic | Rule |
+|---|---|
+| Positions | One net position per pair: an opposite margin order reduces it first and flips with the rest |
+| Leverage | Kraken's maximum per pair and side (`leverage_buy` / `leverage_sell` from AssetPairs; 10x for the default pairs). A pair Kraken doesn't offer margin on can't be traded on margin |
+| Collateral | Spot USD (a simplification: on Kraken other coins count too). A position holds back its initial margin (value ÷ leverage at entry) plus its unrealised loss, so spot buys and transfers to futures can't spend that USD |
+| Fees | The spot trading fee, plus Kraken's opening fee on the value opened and a rollover fee every 4 hours (`MARGIN_ROLLOVER_SECS`), both at the borrowed currency's `margin_rate` from Kraken's Assets: USD (0.025%) for a long, the coin (BTC 0.01%, others 0.02%) for a short |
+| Margin level | Equity (spot USD + unrealised P&L of margin positions) ÷ margin used. The form warns below Kraken's margin call (80%) |
+| Liquidation | At Kraken's margin stop (40%) every margin position is closed at market against the real book, the user's USD-reserving orders are cancelled first, and the 0.5% liquidation fee goes to the insurance fund, which also covers any loss beyond the USD |
+| Closing | The Close tab or `POST /api/margin/close` sends a reduce-only market order |
+
 ## Perpetual futures
 
 Perps are simulated against Kraken Futures' real perpetual books and trades (`PF_XBTUSD` and others, WebSocket v1). Matching works as for spot; a fill opens, grows, reduces or flips a position instead of delivering coins.
@@ -100,7 +114,7 @@ While the futures feed is down, perp orders, matching and liquidations pause; sp
 
 ## Ledger
 
-Every balance change goes into a double-entry ledger (the `ledger` table): each fill, fee, starting grant and season reset is a set of entries that sums to zero. Futures add accounts for the futures wallet (`fut:<user>`), isolated margin (`posm:<position>`), funding (`funding`) and the insurance fund (`insurance`). The admin page's ledger audit checks that every asset sums to zero, that each balance equals its ledger history, that reservations equal what open orders hold, and that each isolated position's margin equals its ledger history.
+Every balance change goes into a double-entry ledger (the `ledger` table): each fill, fee, starting grant and season reset is a set of entries that sums to zero. Spot margin needs no extra accounts: its P&L settles in spot USD against `market`, and its opening, rollover and liquidation fees go to `fees` and `insurance`. Futures add accounts for the futures wallet (`fut:<user>`), isolated margin (`posm:<position>`), funding (`funding`) and the insurance fund (`insurance`). The admin page's ledger audit checks that every asset sums to zero, that each balance equals its ledger history, that reservations equal what open orders hold, and that each isolated position's margin equals its ledger history.
 
 ## Leaderboard and seasons
 
@@ -110,7 +124,7 @@ The admin can end a season: the standings are archived, all orders cancelled, an
 
 ## API (for students writing bots)
 
-Create an API key on the Account page and send `Authorization: Bearer <key>` with every request. Perp orders use the same `POST /api/orders` with `symbol` set to e.g. `BTC-PERP` and optionally `reduce_only`; the futures wallet, transfers, leverage settings, margin top-ups, one-click close, position history and funding history are under `/api/futures/*`. Order fields follow Kraken's names (`limit_price`, `trigger_price`, `time_in_force`, `post_only`); authentication is simplified to a bearer token. A full example is under Account → API quick start.
+Create an API key on the Account page and send `Authorization: Bearer <key>` with every request. Margin orders are spot orders with `"leverage": 2` (or more) and optionally `reduce_only`; the margin account, one-click close and position history are under `/api/margin*`. Perp orders use the same `POST /api/orders` with `symbol` set to e.g. `BTC-PERP` and optionally `reduce_only`; the futures wallet, transfers, leverage settings, margin top-ups, one-click close, position history and funding history are under `/api/futures/*`. Order fields follow Kraken's names (`limit_price`, `trigger_price`, `time_in_force`, `post_only`); authentication is simplified to a bearer token. A full example is under Account → API quick start.
 
 | Endpoint | Purpose |
 |---|---|
@@ -118,6 +132,7 @@ Create an API key on the Account page and send `Authorization: Bearer <key>` wit
 | `GET /api/orders`, `?status=closed`, `/{id}` | Open orders, order history, one order |
 | `DELETE /api/orders/{id}`, `DELETE /api/orders` | Cancel one, cancel all |
 | `GET /api/portfolio`, `/api/fills` | Balances, fills |
+| `GET /api/margin`, `POST /api/margin/close`, `GET /api/margin/positions` | Spot margin: positions, margin level and Kraken's rules; close; history |
 | `GET /api/book`, `/api/trades`, `/api/candles`, `/api/tickers`, `/api/instruments` | Market data |
 | `WS /ws` | Send `{"op":"auth","token":…}`, then `{"op":"subscribe","symbol":…}` |
 
@@ -128,12 +143,12 @@ Order types: `market`, `limit`, `stop-loss`, `take-profit`, `stop-loss-limit`, `
 ## Development
 
 ```bash
-cargo test          # matching, ledger, futures, Kraken message parsing and checksums
+cargo test          # matching, ledger, spot margin, futures, Kraken message parsing and checksums
 FEED=sim ADMIN_PASSWORD=adminpass123 INVITE_CODE=test cargo run
 ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # end-to-end checks against a running server
 ```
 
-`smoke_test.py` uses only the Python standard library and runs 36 checks in about 5 seconds: market data, WebSocket, every order type and its reservations, futures (transfers, leverage, isolated long, adding margin, changing leverage with a position, cross short, reduce-only, closing), account isolation, permissions, one-time invite codes, API keys and the ledger audit. It only needs `ADMIN_PASSWORD`. It uses dedicated accounts `smoke-a` / `smoke-b` / `smoke-c` (registered on the first run with one-time codes it creates), sells back what it bought and disables those accounts at the end, so they never appear on the leaderboard. `deploy.sh` runs it on the server after every deploy (`SMOKE=0 ./deploy.sh` skips it).
+`smoke_test.py` uses only the Python standard library and runs 37 checks in about 5 seconds: market data, WebSocket, every order type and its reservations, a 2x margin short, futures (transfers, leverage, isolated long, adding margin, changing leverage with a position, cross short, reduce-only, closing), account isolation, permissions, one-time invite codes, API keys and the ledger audit. It only needs `ADMIN_PASSWORD`. It uses dedicated accounts `smoke-a` / `smoke-b` / `smoke-c` (registered on the first run with one-time codes it creates), sells back what it bought and disables those accounts at the end, so they never appear on the leaderboard. `deploy.sh` runs it on the server after every deploy (`SMOKE=0 ./deploy.sh` skips it).
 
 | File | Contents |
 |---|---|
@@ -141,6 +156,7 @@ ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # end-to-end checks against 
 | `src/book.rs` | Order book mirror, consumed liquidity, checksum |
 | `src/feed.rs` | Kraken spot feed and the simulated feed (including perps) |
 | `src/kfeed.rs` | Kraken Futures feed, contract rules, perp candles |
+| `src/margin.rs` | Spot margin: positions, held-back USD, rollover, liquidation |
 | `src/futures.rs` | Futures: wallet, positions, margin, funding, liquidation |
 | `src/api.rs` | REST and WebSocket API |
 | `src/accounts.rs` | Users, sessions, API keys, one-time invite codes |

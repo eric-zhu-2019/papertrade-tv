@@ -7,6 +7,7 @@ mod engine;
 mod feed;
 mod futures;
 mod kfeed;
+mod margin;
 #[cfg(test)]
 mod tests;
 mod util;
@@ -59,6 +60,17 @@ async fn main() {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 engine.lock().unwrap().fut_tick(now_ms());
+            }
+        });
+    }
+
+    // spot margin: charge rollover when due and liquidate accounts at the margin stop, once a second
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                engine.lock().unwrap().margin_tick(now_ms());
             }
         });
     }

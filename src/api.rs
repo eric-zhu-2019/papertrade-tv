@@ -105,6 +105,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/futures/margin", post(fut_margin))
         .route("/api/futures/positions", get(fut_positions))
         .route("/api/futures/funding", get(fut_funding))
+        .route("/api/margin", get(margin_account))
+        .route("/api/margin/close", post(margin_close))
+        .route("/api/margin/positions", get(margin_positions))
         .route("/api/admin/users", get(admin_users))
         .route("/api/admin/users/:id/password", post(admin_password))
         .route("/api/admin/users/:id/disabled", post(admin_disabled))
@@ -360,6 +363,11 @@ async fn place_order(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) 
         },
         post_only: b["post_only"].as_bool().unwrap_or(false),
         reduce_only: b["reduce_only"].as_bool().unwrap_or(false),
+        // a spot margin order; 1 (or none) is a plain cash order
+        leverage: match &b["leverage"] {
+            Value::Null => None,
+            v => Some(dec(v).ok_or_else(|| bad("leverage is not a number"))?).filter(|l| *l != rust_decimal::Decimal::ONE),
+        },
         note: b["note"].as_str().map(|s| s.to_string()),
     };
     submit(&st, a.0.id, req)
@@ -500,9 +508,42 @@ async fn fut_close(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) ->
         tif: Tif::Gtc,
         post_only: false,
         reduce_only: true,
+        leverage: None,
         note: b["note"].as_str().map(|s| s.to_string()).or(Some("close position".into())),
     };
     submit(&st, a.0.id, req)
+}
+
+async fn margin_account(State(st): State<AppState>, a: Auth) -> R {
+    Ok(Json(st.engine.lock().unwrap().margin_account_json(a.0.id)))
+}
+
+/// Close the whole spot margin position on a pair with a reduce-only market order.
+async fn margin_close(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) -> R {
+    let symbol = b["symbol"].as_str().unwrap_or("").to_uppercase();
+    let (size, lev) = {
+        let e = st.engine.lock().unwrap();
+        e.mpos.get(&(a.0.id, symbol.clone())).map(|p| (p.size, p.leverage)).ok_or_else(|| bad("no open margin position on this pair"))?
+    };
+    let req = OrderReq {
+        symbol,
+        side: if size > rust_decimal::Decimal::ZERO { Side::Sell } else { Side::Buy },
+        otype: OType::Market,
+        qty: size.abs(),
+        limit_price: None,
+        trigger_price: None,
+        tif: Tif::Gtc,
+        post_only: false,
+        reduce_only: true,
+        leverage: Some(lev),
+        note: b["note"].as_str().map(|s| s.to_string()).or(Some("close position".into())),
+    };
+    submit(&st, a.0.id, req)
+}
+
+async fn margin_positions(State(st): State<AppState>, a: Auth, Query(q): Q) -> R {
+    let limit = q.get("limit").and_then(|d| d.parse().ok()).unwrap_or(100i64).clamp(1, 500);
+    Ok(Json(json!({"positions": st.engine.lock().unwrap().margin_history(a.0.id, limit)})))
 }
 
 async fn fut_positions(State(st): State<AppState>, a: Auth, Query(q): Q) -> R {

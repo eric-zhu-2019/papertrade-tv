@@ -43,6 +43,7 @@ fn cfg() -> Config {
         liq_fee: d("0.005"),
         fut_default_leverage: d("10"),
         sim_funding_secs: 3600,
+        margin_rollover_secs: 14400,
     }
 }
 
@@ -84,6 +85,7 @@ fn req(side: Side, otype: OType, qty: &str, limit: Option<&str>) -> OrderReq {
         tif: Tif::Gtc,
         post_only: false,
         reduce_only: false,
+        leverage: None,
         note: None,
     }
 }
@@ -946,4 +948,150 @@ fn adding_margin_moves_the_liquidation_price_away() {
     go(&mut e, bob, preq(Side::Buy, OType::Market, "1", None));
     assert!(e.adjust_margin(bob, PERP, d("10"), T0).is_err()); // cross has no margin of its own
     audit(&e);
+}
+
+// ------------------------------------------------------------------ spot margin
+
+fn mreq(side: Side, otype: OType, qty: &str, limit: Option<&str>, lev: u32) -> OrderReq {
+    OrderReq { leverage: Some(Decimal::from(lev)), ..req(side, otype, qty, limit) }
+}
+
+fn mpos_size(e: &Engine, uid: i64) -> Decimal {
+    e.mpos.get(&(uid, "BTC/USD".to_string())).map(|p| p.size).unwrap_or_default()
+}
+
+fn btc_book(e: &mut Engine, bid: &str, ask: &str) {
+    e.on_book_snapshot("BTC/USD", &lv(&[(bid, "5")]), &lv(&[(ask, "5")]), T0);
+}
+
+#[test]
+fn margin_short_opens_without_coins_and_closes_with_profit() {
+    let (mut e, u) = setup();
+    go(&mut e, u, mreq(Side::Sell, OType::Market, "1", None, 5));
+    // sold 1 BTC we never had at the 99.9 bid: fee 0.4%, opening fee 0.01% (BTC's rate), margin 99.9 / 5
+    assert_eq!(mpos_size(&e, u), d("-1"));
+    let p = e.mpos[&(u, "BTC/USD".to_string())].clone();
+    assert_eq!((p.entry, p.margin), (d("99.9"), d("19.98")));
+    assert_eq!(bal(&e, u, "BTC").0, Decimal::ZERO);
+    assert_eq!(bal(&e, u, "USD"), (d("100000") - d("0.3996") - d("0.00999"), Decimal::ZERO));
+    // margin and the unrealised loss at the mark are held back from spot
+    let (upnl, used, _) = e.margin_state(u);
+    assert_eq!(used, d("19.98"));
+    assert_eq!(e.free(u, "USD"), bal(&e, u, "USD").0 - used + upnl);
+    audit(&e);
+
+    btc_book(&mut e, "89.9", "90.0");
+    go(&mut e, u, OrderReq { reduce_only: true, ..mreq(Side::Buy, OType::Market, "1", None, 5) });
+    assert!(e.mpos.is_empty());
+    // +9.9 on the short, less the 0.36 fee to buy back
+    assert_eq!(bal(&e, u, "USD").0, d("100000") - d("0.3996") - d("0.00999") + d("9.9") - d("0.36"));
+    assert_eq!(e.free(u, "USD"), bal(&e, u, "USD").0);
+    assert_eq!(e.margin_history(u, 10)[0]["realized"], "9.9");
+    audit(&e);
+}
+
+#[test]
+fn margin_orders_reserve_usd_and_are_validated() {
+    let (mut e, u) = setup();
+    assert!(e.place_order(u, mreq(Side::Sell, OType::Market, "1", None, 11), T0).unwrap_err().contains("at most 10x"));
+    assert!(e.place_order(u, OrderReq { leverage: Some(d("2.5")), ..req(Side::Sell, OType::Market, "1", None) }, T0).is_err());
+    assert!(e.place_order(u, OrderReq { reduce_only: true, ..mreq(Side::Buy, OType::Market, "1", None, 2) }, T0).is_err());
+    assert!(e.place_order(u, OrderReq { symbol: "BTC-PERP".into(), ..mreq(Side::Buy, OType::Market, "1", None, 2) }, T0).is_err());
+    // a resting margin sell reserves USD (margin + fees), not BTC
+    let id = go(&mut e, u, mreq(Side::Sell, OType::Limit, "1", Some("105"), 2));
+    assert_eq!(bal(&e, u, "USD").1, d("52.9305"));
+    assert_eq!(bal(&e, u, "BTC").1, Decimal::ZERO);
+    audit(&e);
+    e.cancel_order(u, id, T0).unwrap();
+    assert_eq!(bal(&e, u, "USD").1, Decimal::ZERO);
+    // not enough USD for the margin
+    e.fut_transfer(u, d("99990"), true, T0).unwrap();
+    assert!(e.place_order(u, mreq(Side::Sell, OType::Market, "1", None, 2), T0).unwrap_err().contains("insufficient margin"));
+    audit(&e);
+}
+
+#[test]
+fn margin_held_back_cannot_be_spent_or_moved() {
+    let (mut e, u) = setup();
+    e.fut_transfer(u, d("99900"), true, T0).unwrap(); // 100 USD left in spot
+    go(&mut e, u, mreq(Side::Sell, OType::Market, "1", None, 2)); // margin 49.95
+    let free = e.free(u, "USD");
+    assert!(free < d("51") && free > d("49"), "free {free}");
+    assert!(e.fut_transfer(u, d("60"), true, T0).is_err());
+    assert!(e.place_order(u, req(Side::Buy, OType::Limit, "0.6", Some("99")), T0).unwrap_err().contains("insufficient USD"));
+    audit(&e);
+}
+
+#[test]
+fn resting_margin_short_fills_as_maker_from_real_trades() {
+    let (mut e, u) = setup();
+    go(&mut e, u, mreq(Side::Sell, OType::Limit, "1", Some("100.5"), 3));
+    e.on_trade("BTC/USD", d("100.6"), d("2"), Side::Buy, T0, true, T0);
+    let p = e.mpos[&(u, "BTC/USD".to_string())].clone();
+    assert_eq!((p.size, p.entry, p.margin), (d("-1"), d("100.5"), d("33.5")));
+    assert_eq!(bal(&e, u, "USD").1, Decimal::ZERO);
+    audit(&e);
+}
+
+#[test]
+fn margin_rollover_is_charged_every_period() {
+    let (mut e, u) = setup();
+    go(&mut e, u, mreq(Side::Buy, OType::Market, "1", None, 4)); // long borrows USD: 0.025%
+    let before = bal(&e, u, "USD").0;
+    let t = T0 + 4 * 3600 * 1000 + 1;
+    e.feed_up(t);
+    e.margin_tick(t);
+    let mark = e.mark("BTC/USD").unwrap();
+    assert_eq!(bal(&e, u, "USD").0, before - round8(mark * d("0.00025")));
+    e.margin_tick(t + 1000); // not again until the next period
+    assert_eq!(bal(&e, u, "USD").0, before - round8(mark * d("0.00025")));
+    audit(&e);
+}
+
+#[test]
+fn margin_stop_liquidates_and_insurance_covers_the_shortfall() {
+    let (mut e, u) = setup();
+    e.fut_transfer(u, d("99970"), true, T0).unwrap(); // 30 USD in spot
+    go(&mut e, u, mreq(Side::Sell, OType::Market, "1", None, 5));
+    let liq = e.margin_liq_price(&e.mpos[&(u, "BTC/USD".to_string())].clone()).unwrap();
+    assert!(liq > d("121") && liq < d("122"), "liq {liq}");
+    btc_book(&mut e, "115.0", "115.1");
+    e.margin_tick(T0);
+    assert_eq!(mpos_size(&e, u), d("-1")); // above the stop: still open
+    btc_book(&mut e, "129.9", "130.0");
+    e.margin_tick(T0);
+    assert!(e.mpos.is_empty());
+    assert_eq!(bal(&e, u, "USD"), (Decimal::ZERO, Decimal::ZERO));
+    assert_eq!(e.margin_history(u, 10)[0]["close_reason"], "liquidated");
+    let r = e.reconcile();
+    assert!(r["insurance_fund"]["USD"].as_str().unwrap().starts_with('-'));
+    audit(&e);
+}
+
+#[test]
+fn new_season_settles_margin_positions() {
+    let (mut e, u) = setup();
+    go(&mut e, u, mreq(Side::Sell, OType::Market, "1", None, 2));
+    e.new_season("S2", T0);
+    assert!(e.mpos.is_empty());
+    assert_eq!(bal(&e, u, "USD").0, d("100000"));
+    audit(&e);
+}
+
+#[test]
+fn kraken_margin_rules_are_parsed() {
+    let (mut e, _) = setup();
+    let pairs: serde_json::Value = serde_json::from_str(
+        r#"{"XXBTZUSD":{"wsname":"XBT/USD","leverage_buy":[2,3,4,5],"leverage_sell":[2,3],"margin_call":80,"margin_stop":40}}"#,
+    )
+    .unwrap();
+    let assets: serde_json::Value =
+        serde_json::from_str(r#"{"XXBT":{"altname":"XBT","margin_rate":"0.01"},"ZUSD":{"altname":"USD","margin_rate":"0.025"}}"#).unwrap();
+    assert_eq!(crate::feed::apply_margin_rules(&mut e, &pairs, &assets), 1);
+    let r = e.margin_rule("BTC/USD");
+    assert_eq!((r.max_long, r.max_short), (d("5"), d("3")));
+    assert_eq!((r.long_rate, r.short_rate, r.stop_level), (d("0.00025"), d("0.0001"), d("0.4")));
+    let (mut e2, u) = setup();
+    crate::feed::apply_margin_rules(&mut e2, &pairs, &assets);
+    assert!(e2.place_order(u, mreq(Side::Sell, OType::Market, "1", None, 4), T0).unwrap_err().contains("at most 3x"));
 }

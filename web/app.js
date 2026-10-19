@@ -35,7 +35,11 @@ const fmtDT = (ms) => { const d = new Date(ms); return `${pad(d.getMonth() + 1)}
 const base = (sym) => sym.split("/")[0].replace(/-PERP$/, "");
 const isPerp = (sym) => !!(S.cfg && S.cfg.perps.includes(sym));
 const signUsd = (x) => (x == null ? "–" : (+x > 0 ? "+" : "") + fmtUsd(x));
-const position = (sym) => (S.fut ? S.fut.positions.find((p) => p.symbol === sym) : null);
+const position = (sym) => isPerp(sym)
+  ? (S.fut ? S.fut.positions.find((p) => p.symbol === sym) : null)
+  : (S.margin ? S.margin.positions.find((p) => p.symbol === sym) : null);
+/// Spot margin order: the leverage picked in the form (1 = a plain cash order).
+const spotLev = () => (isPerp(S.symbol) ? 1 : +form.mlev.value || 1);
 const floorTo = (x, dp) => Math.floor(x * 10 ** dp + 1e-9) / 10 ** dp;
 
 async function api(path, opts = {}) {
@@ -185,6 +189,10 @@ function onMessage(m) {
       refreshSoon();
       break;
     case "futures":
+      refreshSoon();
+      break;
+    case "margin":
+      S.margin = m.account; updateForm();
       refreshSoon();
       break;
     case "order": {
@@ -452,18 +460,33 @@ function updateForm() {
   $("#row-margin").classList.toggle("hidden", !perp || S.futAct === "close");
   $("#fut-panel").classList.toggle("hidden", !perp);
   const btn = $("#submit-order");
-  // perps: an Open / Close tab. Open is Long / Short; Close is Close long / Close short and reduce-only
-  const closing = perp && S.futAct === "close";
+  // spot: 1x is a cash order, 2x and up a margin order (Kraken's leverage for the pair)
+  const rule = !perp && S.margin && S.margin.rules[sym];
+  const maxLev = rule ? Math.max(+rule.max_long, +rule.max_short) : 1;
+  const levs = ["1", ...Array.from({ length: Math.max(0, maxLev - 1) }, (_, i) => String(i + 2))];
+  const optsKey = sym + levs.length + S.lang;
+  if (form.mlev.dataset.k !== optsKey) {
+    const cur = form.mlev.value || store.get("pt_mlev") || "1";
+    form.mlev.innerHTML = levs.map((l) => `<option value="${l}">${l === "1" ? esc(t("cash_1x")) : l + esc(t("margin_x"))}</option>`).join("");
+    form.mlev.value = levs.includes(cur) ? cur : "1";
+    form.mlev.dataset.k = optsKey;
+  }
+  $("#mlev-hint").textContent = maxLev > 1 ? t("margin_hint") : "";
+  const margin = !perp && +form.mlev.value > 1;
+  // perps and margin: an Open / Close tab. Open is Long / Short; Close is Close long / Close short and reduce-only
+  const posMode = perp || margin;
+  const closing = posMode && S.futAct === "close";
   form.reduce_only.checked = closing;
-  $("#act-seg").classList.toggle("hidden", !perp);
+  $("#row-mlev").classList.toggle("hidden", perp || maxLev < 2 || closing);
+  $("#act-seg").classList.toggle("hidden", !posMode);
   $$("#act-seg button").forEach((b) => b.classList.toggle("on", b.dataset.act === (closing ? "close" : "open")));
   $("#side-seg").classList.toggle("closing", closing); // Close long (a sell) goes first
   $("#row-reduce").classList.add("hidden");
-  const [buyLbl, sellLbl] = !perp ? [t("buy"), t("sell")] : closing ? [t("close_short"), t("close_long")] : [t("open_long"), t("open_short")];
+  const [buyLbl, sellLbl] = !posMode ? [t("buy"), t("sell")] : closing ? [t("close_short"), t("close_long")] : [t("open_long"), t("open_short")];
   $('#side-seg [data-side="buy"]').textContent = buyLbl;
   $('#side-seg [data-side="sell"]').textContent = sellLbl;
   const reduce = closing;
-  btn.textContent = perp
+  btn.textContent = posMode
     ? `${t(reduce ? (S.side === "buy" ? "close_short" : "close_long") : S.side === "buy" ? "open_long" : "open_short")} ${base(sym)}`
     : `${t(S.side)} ${base(sym)}`;
   btn.className = "primary " + S.side;
@@ -482,6 +505,13 @@ function updateForm() {
       ? `${t("closable")}: ${pos ? fmtQty(pos.size) : 0} ${base(sym)}`
       : `${t("fut_avail")}: ${S.fut ? fmtUsd(S.fut.available) : "–"} ${S.cfg.quote}`;
     renderFutPanel();
+  } else if (margin) {
+    const pos = closablePos(), m = S.margin, lvl = m && m.margin_level != null ? +m.margin_level : null;
+    const level = lvl == null ? "" : ` · ${t("margin_level")} ${lvl.toFixed(0)}%`;
+    $("#avail").innerHTML = esc(closing
+      ? `${t("closable")}: ${pos ? fmtQty(pos.size) : 0} ${base(sym)}`
+      : `${t("margin_avail")}: ${num(assetAvail(S.cfg.quote), 0, 2)} ${S.cfg.quote}`) +
+      (level ? `<span class="${lvl < +rule.call_level * 100 ? "down" : ""}">${esc(level)}</span>` : "");
   } else {
     const asset = S.side === "buy" ? S.cfg.quote : base(sym);
     $("#avail").textContent = `${t("avail_lbl")}: ${num(assetAvail(asset), 0, 8)} ${asset}`;
@@ -538,7 +568,8 @@ $("#qty-unit").addEventListener("click", (e) => {
 });
 function updateEstimate() {
   const q = orderQty(), qty = +q, type = form.type.value, el = $("#est");
-  if (isPerp(S.symbol) && S.futAct === "close" && !closablePos()) { el.textContent = t("no_pos_to_close"); return; }
+  const posMode = isPerp(S.symbol) || spotLev() > 1;
+  if (posMode && S.futAct === "close" && !closablePos()) { el.textContent = t("no_pos_to_close"); return; }
   const minQ = +((S.inst[S.symbol] || {}).qty_min || 0);
   if (qtyInUsd() && +form.qty.value > 0 && q != null && !(qty > 0 && qty >= minQ)) { el.textContent = `${t("qty_too_small")} (${fmtQty(minQ)} ${base(S.symbol)})`; return; }
   if (!(qty > 0)) { el.textContent = ""; return; }
@@ -553,20 +584,37 @@ function updateEstimate() {
     el.textContent = `${t("value")} $${fmtUsd(cost)}${margin} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
     return;
   }
-  const fee = cost * +(maker ? S.cfg.maker_fee : S.cfg.taker_fee);
+  let fee = cost * +(maker ? S.cfg.maker_fee : S.cfg.taker_fee);
+  if (spotLev() > 1) {
+    // margin: the opening fee is charged on what opens a position
+    const closing = form.reduce_only.checked;
+    if (!closing) fee += cost * marginRate();
+    const margin = closing ? "" : ` · ${t("est_margin")} ≈ $${fmtUsd(cost / spotLev())}`;
+    el.textContent = `${t("value")} $${fmtUsd(cost)}${margin} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
+    return;
+  }
   el.textContent = `${t("est_cost")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
 }
-form.addEventListener("input", (e) => { if (e.target !== form.qty) S.qtyExact = null; updateForm(); });
+form.addEventListener("input", (e) => {
+  if (e.target !== form.qty) S.qtyExact = null;
+  if (e.target === form.mlev) store.set("pt_mlev", form.mlev.value);
+  updateForm();
+});
 $("#side-seg").addEventListener("click", (e) => {
   if (!e.target.dataset.side) return;
   S.side = e.target.dataset.side;
-  if (isPerp(S.symbol) && S.futAct === "close") return fillClose();
+  if ((isPerp(S.symbol) || spotLev() > 1) && S.futAct === "close") return fillClose();
   updateForm();
 });
 /// The position the Close tab would reduce: a long for Close long (a sell), a short for Close short.
 function closablePos() {
   const p = position(S.symbol);
   return p && p.side === (S.side === "sell" ? "long" : "short") ? p : null;
+}
+/// Spot margin opening / rollover fee rate: the borrowed currency's (USD for a long, the coin for a short).
+function marginRate() {
+  const r = S.margin && S.margin.rules[S.symbol];
+  return r ? +(S.side === "buy" ? r.long_rate : r.short_rate) : 0;
 }
 /// Close tab: pick the side that closes the open position and fill in its whole size.
 function fillClose() {
@@ -598,6 +646,16 @@ $("#pcts").addEventListener("click", (e) => {
       if (form.type.value === "market") px *= 1.003;
       const lev = Math.max(1, +form.leverage.value || 1);
       q = (+S.fut.available * p) / (px * (1 / lev + +S.cfg.fut_taker_fee)) * 0.999;
+    }
+    return setPctQty(String(floorTo(q, dp)));
+  }
+  if (spotLev() > 1) {
+    if (form.reduce_only.checked) { const c = closablePos(); if (c && p === 1) return setPctQty(c.size); q = c ? +c.size * p : 0; }
+    else {
+      let px = refPrice(); if (!px) return;
+      if (form.type.value === "market") px *= 1.003;
+      const fee = Math.max(+S.cfg.taker_fee, +S.cfg.maker_fee);
+      q = assetAvail(S.cfg.quote) * p / (px * (1 / spotLev() + fee + marginRate())) * 0.999;
     }
     return setPctQty(String(floorTo(q, dp)));
   }
@@ -633,6 +691,7 @@ form.addEventListener("submit", async (e) => {
   if (type !== "limit" && type !== "market") body.trigger_price = f.trigger_price.trim();
   if (type === "limit") { body.time_in_force = f.time_in_force; body.post_only = !!f.post_only; }
   if (isPerp(S.symbol)) body.reduce_only = !!f.reduce_only;
+  if (spotLev() > 1) { body.leverage = spotLev(); body.reduce_only = !!f.reduce_only; }
   try {
     const r = await api("/orders", { method: "POST", body });
     toast(`${t("order_sent")} #${r.order.id}`);
@@ -802,7 +861,7 @@ const typeName = (ty) => ({ limit: t("t_limit"), market: t("t_market"), "stop-lo
 const TABS = {
   open: { load: () => api("/orders").then((r) => r.orders), cols: () => [
     { h: t("time"), f: (o) => fmtDT(o.created_ms) }, { h: t("market"), f: (o) => esc(o.symbol) }, { h: t("side"), f: sideCell },
-    { h: t("type"), f: (o) => esc(typeName(o.type)) + (o.post_only ? " · PO" : "") },
+    { h: t("type"), f: (o) => esc(typeName(o.type)) + (o.post_only ? " · PO" : "") + (o.leverage ? ` · ${esc(o.leverage)}x` : "") },
     { h: t("price"), f: (o) => fmtPrice(o.symbol, o.limit_price) }, { h: t("trigger"), f: (o) => fmtPrice(o.symbol, o.trigger_price) },
     { h: t("qty"), f: (o) => fmtQty(o.qty) }, { h: t("filled"), f: (o) => fmtQty(o.filled) },
     { h: t("queue"), f: (o) => (o.status === "open" && o.queue_ahead != null ? fmtQty(o.queue_ahead) : "–") },
@@ -811,7 +870,7 @@ const TABS = {
   ] },
   history: { load: () => api("/orders?status=closed&limit=200").then((r) => r.orders), cols: () => [
     { h: t("time"), f: (o) => fmtDT(o.created_ms) }, { h: t("market"), f: (o) => esc(o.symbol) }, { h: t("side"), f: sideCell },
-    { h: t("type"), f: (o) => esc(typeName(o.type)) }, { h: t("price"), f: (o) => fmtPrice(o.symbol, o.limit_price || o.trigger_price) },
+    { h: t("type"), f: (o) => esc(typeName(o.type)) + (o.leverage ? ` · ${esc(o.leverage)}x` : "") }, { h: t("price"), f: (o) => fmtPrice(o.symbol, o.limit_price || o.trigger_price) },
     { h: t("qty"), f: (o) => fmtQty(o.qty) }, { h: t("filled"), f: (o) => fmtQty(o.filled) },
     { h: t("avg_price"), f: (o) => fmtPrice(o.symbol, o.avg_price) }, { h: t("fee"), f: (o) => num(o.fee, 2, 4) },
     { h: t("status"), f: (o) => esc(t("s_" + o.status)) },
@@ -823,26 +882,35 @@ const TABS = {
     { h: t("cost"), f: (x) => fmtUsd(x.cost) }, { h: t("fee"), f: (x) => num(x.fee, 2, 4) },
     { h: t("role"), f: (x) => esc(t(x.liquidity)) }, { h: t("note"), c: "txt", f: (x) => esc(x.note) },
   ] },
-  positions: { load: () => api("/futures/account").then((r) => { S.fut = r; return r.positions; }), cols: () => [
+  // perp positions and spot margin positions together
+  positions: { load: async () => {
+    const [f, m] = await Promise.all([S.cfg.perps.length ? api("/futures/account") : null, api("/margin")]);
+    if (f) S.fut = f; S.margin = m;
+    return [...(f ? f.positions : []), ...m.positions.map((p) => ({ ...p, margin_mode: "margin", funding: String(-p.rollover) }))];
+  }, cols: () => [
     { h: t("market"), c: "name", f: (p) => `<a href="#" data-go="${esc(p.symbol)}">${esc(p.symbol)}</a>` },
     { h: t("side"), f: (p) => `<span class="${p.side === "long" ? "up" : "down"}">${esc(t(p.side))}</span>` },
     { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
     { h: t("mark_price"), f: (p) => fmtPrice(p.symbol, p.mark) },
     { h: t("liq_price"), f: (p) => (p.liq_price ? `<span class="down">${fmtPrice(p.symbol, p.liq_price)}</span>` : "–") },
-    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode))} ${esc(p.leverage)}x</span>` +
+    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode === "margin" ? "spot_margin" : p.margin_mode))} ${esc(p.leverage)}x</span>` +
       (p.margin_mode === "isolated" ? `<button class="mini" data-addm="${esc(p.symbol)}" title="${esc(t("add_margin"))}">+</button><button class="mini" data-subm="${esc(p.symbol)}" title="${esc(t("remove_margin"))}">−</button>` : "") },
     { h: t("pnl"), f: (p) => `<span class="${cls(+p.unrealized_pnl)}">${signUsd(p.unrealized_pnl)} (${pct(+p.roe_pct)})</span>` },
-    { h: t("funding"), f: (p) => `<span class="${cls(+p.funding)}">${signUsd(p.funding)}</span>` },
+    { h: t("funding_rollover"), f: (p) => `<span class="${cls(+p.funding)}">${signUsd(p.funding)}</span>` },
     { h: "", f: (p) => `<button data-close="${esc(p.symbol)}">${esc(t("close_pos"))}</button>` },
   ] },
-  pos_history: { load: () => api("/futures/positions?limit=200").then((r) => r.positions), cols: () => [
+  pos_history: { load: async () => {
+    const [f, m] = await Promise.all([S.cfg.perps.length ? api("/futures/positions?limit=200") : { positions: [] }, api("/margin/positions?limit=200")]);
+    const margin = m.positions.map((p) => ({ ...p, net: p.net_pnl, funding: String(-p.rollover), margin_mode: "margin", reason: p.close_reason }));
+    return [...f.positions, ...margin].sort((a, b) => b.closed_ms - a.closed_ms);
+  }, cols: () => [
     { h: t("time"), f: (p) => fmtDT(p.closed_ms) }, { h: t("market"), f: (p) => esc(p.symbol) },
     { h: t("side"), f: (p) => `<span class="${p.side === "long" ? "up" : "down"}">${esc(t(p.side))}</span>` },
     { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
     { h: t("exit_price"), f: (p) => fmtPrice(p.symbol, p.exit) },
     { h: t("net_pnl"), f: (p) => `<b class="${cls(+p.net)}">${signUsd(p.net)}</b>` }, { h: t("realized"), f: (p) => signUsd(p.realized) },
-    { h: t("fee"), f: (p) => fmtUsd(p.fees) }, { h: t("funding"), f: (p) => signUsd(p.funding) },
-    { h: t("margin"), f: (p) => `${esc(t(p.margin_mode))} ${esc(p.leverage)}x` },
+    { h: t("fee"), f: (p) => fmtUsd(p.fees) }, { h: t("funding_rollover"), f: (p) => signUsd(p.funding) },
+    { h: t("margin"), f: (p) => `${esc(t(p.margin_mode === "margin" ? "spot_margin" : p.margin_mode))} ${esc(p.leverage)}x` },
     { h: t("reason"), c: "txt", f: (p) => `<span class="${p.reason === "liquidated" ? "down" : ""}">${esc(t("r_" + p.reason))}</span>` },
   ] },
   funding: { load: () => api("/futures/funding?limit=200").then((r) => r.funding), cols: () => [
@@ -864,7 +932,8 @@ async function loadTab() {
   try { const rows = await TABS[tab].load(); if (tab === S.tab) { tabRows = rows; renderTab(); } } catch {}
   if (tab === "open") setOrders(tabRows);
   else api("/orders").then((r) => { setOrders(r.orders); $("#open-count").textContent = r.orders.length || ""; }).catch(() => {});
-  $("#pos-count").textContent = S.fut && S.fut.positions.length ? S.fut.positions.length : "";
+  const npos = (S.fut ? S.fut.positions.length : 0) + (S.margin ? S.margin.positions.length : 0);
+  $("#pos-count").textContent = npos || "";
 }
 function renderTab() {
   const orderTab = S.tab === "open" || S.tab === "history";
@@ -898,7 +967,7 @@ $("#tab-table").addEventListener("click", async (e) => {
     // closing at market is not undoable: ask for a second click
     if (closeArmed !== sym) { closeArmed = sym; e.target.textContent = t("confirm_close"); setTimeout(() => { if (closeArmed === sym) { closeArmed = null; renderTab(); } }, 3000); return; }
     closeArmed = null;
-    try { const r = await api("/futures/close", { method: "POST", body: { symbol: sym } }); toast(`${t("order_sent")} #${r.order.id}`); } catch (ex) { toast(ex.message, "bad"); }
+    try { const r = await api(isPerp(sym) ? "/futures/close" : "/margin/close", { method: "POST", body: { symbol: sym } }); toast(`${t("order_sent")} #${r.order.id}`); } catch (ex) { toast(ex.message, "bad"); }
     return refreshSoon();
   }
   const id = e.target.dataset.cancel; if (!id) return;
@@ -910,8 +979,8 @@ $("#cancel-all").addEventListener("click", async () => { try { await api("/order
 async function refresh() {
   if (!S.me) return;
   try {
-    const [p, f] = await Promise.all([api("/portfolio"), S.cfg.perps.length ? api("/futures/account") : null]);
-    S.portfolio = p; if (f) S.fut = f;
+    const [p, f, m] = await Promise.all([api("/portfolio"), S.cfg.perps.length ? api("/futures/account") : null, api("/margin")]);
+    S.portfolio = p; if (f) S.fut = f; S.margin = m;
     renderSymHead(); updateForm();
   } catch {}
   if (S.view === "trade") loadTab();
@@ -1008,6 +1077,13 @@ GET    /api/orders                 open orders          GET /api/orders?status=c
 GET    /api/orders/{id}            one order            DELETE /api/orders/{id}         cancel
 DELETE /api/orders                 cancel all           GET /api/fills                  your fills
 GET    /api/tickers | /api/instruments | /api/trades?symbol= | /api/candles?symbol=&interval=1|5|15|60|240|1440
+
+# Spot margin (Kraken-style): add "leverage" to a spot order to open a position; a margin sell is a short
+POST /api/orders            {"symbol":"BTC/USD","side":"sell","type":"market","qty":"0.01","leverage":2}
+                            optional "reduce_only":true; margin and unrealised losses are held back from spot USD
+GET  /api/margin            positions, margin level, Kraken's leverage limits and fee rates
+POST /api/margin/close      {"symbol":"BTC/USD"}   market-close the whole position
+GET  /api/margin/positions  closed positions
 
 # Perpetual futures (symbols like BTC-PERP; a separate USD wallet; 1 contract = 1 coin)
 POST /api/futures/transfer  {"amount":"1000","to":"futures"|"spot"}

@@ -883,7 +883,7 @@ impl Engine {
     }
 
     /// Realised P&L against the market: profit comes from it, loss goes to it.
-    fn pnl_entry(&mut self, txn: i64, now: i64, wallet: &str, pnl: Decimal, rf: i64) {
+    pub(crate) fn pnl_entry(&mut self, txn: i64, now: i64, wallet: &str, pnl: Decimal, rf: i64) {
         let quote = self.cfg.quote.clone();
         if pnl > Decimal::ZERO {
             self.transfer(txn, now, "market", wallet, &quote, pnl, "pnl", rf);
@@ -1076,6 +1076,7 @@ impl Engine {
             tif: crate::engine::Tif::Gtc,
             post_only: false,
             reduce_only: true,
+            leverage: None,
             qty,
             limit_price: None,
             trigger_price: None,

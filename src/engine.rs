@@ -14,6 +14,7 @@ use crate::book::{Book, Level, Side};
 use crate::candles::CandleStore;
 use crate::config::Config;
 use crate::futures::{FutAcct, MarginMode, Perp, Position};
+use crate::margin::{MPos, MarginRule};
 use crate::util::*;
 use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
@@ -139,6 +140,8 @@ pub struct Order {
     pub post_only: bool,
     /// Perps only: may shrink or close the position but never open or grow one.
     pub reduce_only: bool,
+    /// Spot margin orders only (2x and up): opens or reduces a margin position instead of moving coins.
+    pub leverage: Option<Decimal>,
     pub qty: Decimal,
     pub limit_price: Option<Decimal>,
     pub trigger_price: Option<Decimal>,
@@ -146,7 +149,7 @@ pub struct Order {
     pub cum_cost: Decimal,
     pub fee: Decimal,
     pub status: Status,
-    /// Funds still reserved for this order (spot: quote for buys, base for sells;
+    /// Funds still reserved for this order (spot: quote for buys, base for sells; margin: quote;
     /// perps: USD in the futures wallet for initial margin and fees).
     pub locked: Decimal,
     /// Real-exchange quantity still ahead of this order at its price level.
@@ -183,6 +186,8 @@ pub struct OrderReq {
     pub tif: Tif,
     pub post_only: bool,
     pub reduce_only: bool,
+    /// Spot only: a margin order at this leverage.
+    pub leverage: Option<Decimal>,
     pub note: Option<String>,
 }
 
@@ -264,6 +269,9 @@ pub struct Engine {
     pub(crate) funding_due: Vec<(String, i64, Decimal)>,
     /// Set while the engine itself is closing a position for liquidation.
     pub(crate) liquidating: bool,
+    // spot margin (see margin.rs)
+    pub mpos: HashMap<(i64, String), MPos>,
+    pub margin_rules: HashMap<String, MarginRule>,
 }
 
 const SCHEMA: &str = "
@@ -321,6 +329,13 @@ CREATE TABLE IF NOT EXISTS funding(
   symbol TEXT NOT NULL, ts_ms INTEGER NOT NULL, rate TEXT NOT NULL, mark TEXT NOT NULL, amount TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS funding_user ON funding(user_id, season_id, id);
 CREATE TABLE IF NOT EXISTS funding_runs(symbol TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS margin_positions(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, season_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+  size TEXT NOT NULL, entry TEXT NOT NULL, leverage TEXT NOT NULL, margin TEXT NOT NULL, realized TEXT NOT NULL,
+  fees TEXT NOT NULL, rollover TEXT NOT NULL, closed_qty TEXT NOT NULL, closed_value TEXT NOT NULL,
+  opened_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, next_rollover_ms INTEGER NOT NULL,
+  closed_ms INTEGER, close_reason TEXT);
+CREATE INDEX IF NOT EXISTS margin_positions_user ON margin_positions(user_id, season_id, id);
 ";
 
 fn sdec(s: String) -> Decimal {
@@ -347,6 +362,13 @@ impl Engine {
             .unwrap_or(false);
         if !has_reduce_only {
             db.execute_batch("ALTER TABLE orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0").expect("migrate orders");
+        }
+        let has_leverage: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('orders') WHERE name='leverage'")
+            .and_then(|mut st| st.exists([]))
+            .unwrap_or(false);
+        if !has_leverage {
+            db.execute_batch("ALTER TABLE orders ADD COLUMN leverage TEXT").expect("migrate orders");
         }
         let mut e = Engine {
             cfg: cfg.clone(),
@@ -383,6 +405,8 @@ impl Engine {
             funding_done: HashMap::new(),
             funding_due: Vec::new(),
             liquidating: false,
+            mpos: HashMap::new(),
+            margin_rules: HashMap::new(),
         };
         e.load();
         e
@@ -433,6 +457,7 @@ impl Engine {
             }
         }
         self.fut_load();
+        self.margin_load();
         // stats
         {
             let mut st =
@@ -553,8 +578,14 @@ impl Engine {
 
     // ---------------------------------------------------------------- balances
 
+    /// What the user can spend or reserve; for the quote currency, less what margin positions hold back.
     pub fn free(&self, uid: i64, asset: &str) -> Decimal {
-        self.balances.get(&(uid, asset.to_string())).map(|b| b.total - b.locked).unwrap_or(Decimal::ZERO)
+        let raw = self.balances.get(&(uid, asset.to_string())).map(|b| b.total - b.locked).unwrap_or(Decimal::ZERO);
+        if asset == self.cfg.quote {
+            raw - self.margin_hold(uid)
+        } else {
+            raw
+        }
     }
 
     /// Credit a new account (or a new season) with the starting balance.
@@ -587,7 +618,7 @@ impl Engine {
                 eq += b.total * p;
             }
         }
-        eq + self.fut_equity(uid)
+        eq + self.fut_equity(uid) + self.margin_state(uid).0
     }
 
     // ---------------------------------------------------------------- market data in
@@ -750,9 +781,12 @@ impl Engine {
                 o.queue_ahead = Some(qa - eaten);
                 avail = avail.min(qty - eaten);
             }
+            let margin = o.leverage.is_some();
             let mut f = floor_to(avail.min(o.remaining()), qty_inc);
             if f > Decimal::ZERO && self.perps.contains_key(symbol) {
                 f = self.fut_maker_cap(id, p, f, now);
+            } else if f > Decimal::ZERO && margin {
+                f = self.margin_maker_cap(id, p, f, now);
             }
             if f > Decimal::ZERO {
                 self.apply_fill(id, p, f, false, now);
@@ -819,9 +853,12 @@ impl Engine {
                     break;
                 }
                 let Some(o) = self.orders.get(&id) else { break };
+                let margin = o.leverage.is_some();
                 let mut f = o.remaining().min(avail);
                 if f > Decimal::ZERO && self.perps.contains_key(symbol) {
                     f = self.fut_maker_cap(id, p, f, now);
+                } else if f > Decimal::ZERO && margin {
+                    f = self.margin_maker_cap(id, p, f, now);
                 }
                 if f <= Decimal::ZERO {
                     break;
@@ -908,13 +945,19 @@ impl Engine {
         }
 
         let perp = self.perps.contains_key(&req.symbol);
-        if req.reduce_only && !perp {
-            return Err("reduce_only is only for futures".into());
+        let margin = req.leverage.is_some();
+        if margin && perp {
+            return Err("futures leverage is set per market (POST /api/futures/settings), not per order".into());
+        }
+        if req.reduce_only && !perp && !margin {
+            return Err("reduce_only is only for futures and margin orders".into());
         }
 
         // reserve funds
         let (lock_asset, lock_amt) = if perp {
             (String::new(), self.fut_check_order(uid, &req, ref_price)?)
+        } else if margin {
+            (inst.quote.clone(), self.margin_check_order(uid, &req, ref_price)?)
         } else {
             let (lock_asset, lock_amt) = match req.side {
                 Side::Sell => (inst.base.clone(), req.qty),
@@ -955,6 +998,7 @@ impl Engine {
             tif: req.tif,
             post_only: req.post_only,
             reduce_only: req.reduce_only,
+            leverage: req.leverage,
             qty: req.qty,
             limit_price: limit,
             trigger_price: trigger,
@@ -988,8 +1032,8 @@ impl Engine {
         self.db
             .execute(
                 "INSERT INTO orders(user_id, season_id, symbol, side, otype, tif, post_only, qty, limit_price,
-                   trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,'0','0','0',?,?,?,NULL,?,?,?)",
+                   trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only, leverage)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,'0','0','0',?,?,?,NULL,?,?,?,?)",
                 params![
                     o.user_id,
                     o.season_id,
@@ -1006,7 +1050,8 @@ impl Engine {
                     o.note,
                     o.created_ms,
                     o.updated_ms,
-                    o.reduce_only as i64
+                    o.reduce_only as i64,
+                    o.leverage.map(|x| x.to_string())
                 ],
             )
             .expect("insert order");
@@ -1030,7 +1075,12 @@ impl Engine {
             self.finish(oid, Status::Rejected, Some("market data became unavailable before the order reached the book"), now);
             return;
         }
-        if o.reduce_only && self.fut_closable(o.user_id, &o.symbol, o.side).is_zero() {
+        let closable = if o.leverage.is_some() {
+            self.margin_closable(o.user_id, &o.symbol, o.side)
+        } else {
+            self.fut_closable(o.user_id, &o.symbol, o.side)
+        };
+        if o.reduce_only && closable.is_zero() {
             self.finish(oid, Status::Canceled, Some("reduce-only: there is no position left to reduce"), now);
             return;
         }
@@ -1106,6 +1156,8 @@ impl Engine {
             let mut f = o.remaining().min(avail);
             if perp {
                 f = f.min(self.fut_max_fill(oid, p));
+            } else if o.leverage.is_some() {
+                f = f.min(self.margin_max_fill(oid, p));
             } else if side == Side::Buy {
                 let funds = self.free(uid, &inst.quote) + o.locked;
                 let unit = p * (Decimal::ONE + cfg.taker_fee);
@@ -1129,6 +1181,9 @@ impl Engine {
         };
         if self.perps.contains_key(&symbol) {
             return self.fut_apply_fill(oid, price, qty, taker, now);
+        }
+        if self.orders[&oid].leverage.is_some() {
+            return self.margin_apply_fill(oid, price, qty, taker, now);
         }
         let inst = self.instruments[&symbol].clone();
         let cost = round8(price * qty);
@@ -1253,7 +1308,7 @@ impl Engine {
         }
         if !o.locked.is_zero() {
             let (base, quote) = o.symbol.split_once('/').unwrap_or((&o.symbol, &self.cfg.quote));
-            let asset = if o.side == Side::Buy { quote.to_string() } else { base.to_string() };
+            let asset = if o.side == Side::Buy || o.leverage.is_some() { quote.to_string() } else { base.to_string() };
             self.balances.entry((o.user_id, asset.clone())).or_default().locked -= o.locked;
             o.locked = Decimal::ZERO;
             self.save_bal(o.user_id, &asset);
@@ -1347,7 +1402,10 @@ impl Engine {
         {
             let mut st = self
                 .db
-                .prepare("SELECT symbol, side, qty, cost, fee FROM fills WHERE user_id=? AND season_id=? ORDER BY id")
+                .prepare(
+                    "SELECT f.symbol, f.side, f.qty, f.cost, f.fee FROM fills f JOIN orders o ON o.id=f.order_id
+                     WHERE f.user_id=? AND f.season_id=? AND o.leverage IS NULL ORDER BY f.id",
+                )
                 .unwrap();
             let rows = st
                 .query_map(params![uid, self.season_id], |r| {
@@ -1395,14 +1453,16 @@ impl Engine {
             };
             let s = |x: Decimal| x.round_dp(8).normalize().to_string();
             assets.push(json!({
-                "asset": k.1, "total": s(b.total), "locked": s(b.locked), "available": s(b.total - b.locked),
+                "asset": k.1, "total": s(b.total), "locked": s(b.locked), "available": s(self.free(uid, &k.1).max(Decimal::ZERO)),
                 "price": price.map(s), "value": value.map(s), "avg_cost": avg.map(s), "unrealized_pnl": pnl.map(s),
             }));
         }
         // the futures account counts too: wallet + isolated margin + unrealised P&L
         let futures = self.fut_equity(uid);
-        equity += futures;
-        json!({"equity": equity.round_dp(2).to_string(), "futures_equity": futures.round_dp(2).to_string(), "assets": assets,
+        let (margin_upnl, margin_used, _) = self.margin_state(uid);
+        equity += futures + margin_upnl;
+        json!({"equity": equity.round_dp(2).to_string(), "futures_equity": futures.round_dp(2).to_string(),
+               "margin_upnl": margin_upnl.round_dp(2).to_string(), "margin_used": margin_used.round_dp(2).to_string(), "assets": assets,
                "start_balance": self.cfg.start_balance.normalize().to_string()})
     }
 
@@ -1598,6 +1658,7 @@ impl Engine {
             self.finish(id, Status::Canceled, Some("season ended"), now);
         }
         self.fut_season_reset(now);
+        self.margin_season_reset(now);
         // sweep all balances back to the treasury
         let keys: Vec<(i64, String)> = self.balances.keys().cloned().collect();
         for (uid, asset) in keys {
@@ -1689,7 +1750,7 @@ impl Engine {
                 .filter(|o| o.user_id == *uid)
                 .filter(|o| {
                     let (base, quote) = o.symbol.split_once('/').unwrap_or(("", ""));
-                    (if o.side == Side::Buy { quote } else { base }) == asset
+                    (if o.side == Side::Buy || o.leverage.is_some() { quote } else { base }) == asset
                 })
                 .map(|o| o.locked)
                 .sum();
@@ -1701,6 +1762,7 @@ impl Engine {
             }
         }
         self.fut_reconcile(&sums, &mut problems);
+        self.margin_reconcile(&mut problems);
         let sys = |name: &str| -> Value {
             let m: serde_json::Map<String, Value> = sums
                 .iter()
@@ -1718,7 +1780,7 @@ impl Engine {
 }
 
 const ORDER_COLS: &str = "id, user_id, season_id, symbol, side, otype, tif, post_only, qty, limit_price, \
-     trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only";
+     trigger_price, filled, cum_cost, fee, status, locked, note, reason, created_ms, updated_ms, reduce_only, leverage";
 
 fn row_to_order(r: &rusqlite::Row) -> rusqlite::Result<Order> {
     Ok(Order {
@@ -1744,5 +1806,6 @@ fn row_to_order(r: &rusqlite::Row) -> rusqlite::Result<Order> {
         created_ms: r.get(18)?,
         updated_ms: r.get(19)?,
         reduce_only: r.get::<_, i64>(20)? != 0,
+        leverage: odec(r.get(21)?),
     })
 }

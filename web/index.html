@@ -64,10 +64,10 @@
       <div class="panel">
         <div class="tabs" id="tabs">
           <button data-tab="open" class="on"><span data-t="tab_open"></span> <span id="open-count" class="count"></span></button>
-          <button data-tab="positions" class="perp-only"><span data-t="tab_positions"></span> <span id="pos-count" class="count"></span></button>
+          <button data-tab="positions"><span data-t="tab_positions"></span> <span id="pos-count" class="count"></span></button>
           <button data-tab="history" data-t="tab_history"></button>
           <button data-tab="fills" data-t="tab_fills"></button>
-          <button data-tab="pos_history" class="perp-only" data-t="tab_pos_history"></button>
+          <button data-tab="pos_history" data-t="tab_pos_history"></button>
           <button data-tab="funding" class="perp-only" data-t="tab_funding"></button>
           <button data-tab="balances" data-t="tab_balances"></button>
           <button class="link right-btn" id="cancel-all" data-t="cancel_all"></button>
@@ -113,6 +113,9 @@
             </label>
             <label><span><span data-t="leverage"></span> <span id="max-lev" class="muted"></span></span><input name="leverage" type="number" min="1" step="1" inputmode="numeric"></label>
           </div>
+          <label id="row-mlev"><span><span data-t="leverage"></span> <span id="mlev-hint" class="muted"></span></span>
+            <select name="mlev"></select>
+          </label>
           <label><span data-t="order_type"></span>
             <select name="type">
               <option value="limit" data-t="t_limit"></option>
