@@ -60,6 +60,11 @@
           <div class="seg" id="intervals"></div>
         </div>
         <div id="chart"></div>
+        <div id="opt-chain" class="hidden">
+          <div class="opt-bar"><div class="seg" id="opt-exp"></div><span class="muted small" id="opt-meta"></span></div>
+          <div class="table-wrap"><table id="opt-table"></table></div>
+          <p class="muted small" data-t="opt_chain_hint"></p>
+        </div>
       </div>
       <div class="panel">
         <div class="tabs" id="tabs">
@@ -82,6 +87,11 @@
         <div id="asks" class="book-side"></div>
         <div id="spread" class="spread"></div>
         <div id="bids" class="book-side"></div>
+      </div>
+      <div class="panel hidden" id="opt-panel">
+        <h3 data-t="opt_contract"></h3>
+        <div class="fut-stats" id="opt-stats"></div>
+        <p class="muted small" data-t="opt_hint"></p>
       </div>
       <div class="panel hidden" id="fut-panel">
         <h3 data-t="fut_account"></h3>

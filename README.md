@@ -4,7 +4,7 @@ English | [中文](README.zh-CN.md)
 
 Real market data (Kraken's public feeds) with pretend money. Students' orders never go to a real exchange: this server simulates their fills against Kraken's live order books and trade stream. No exchange account or API key is needed.
 
-Two kinds of market: 8 spot pairs (BTC/USD and others) and the matching 8 perpetual futures (BTC-PERP and others, priced from Kraken Futures). Spot pairs can also be traded on margin, as on Kraken, to go long or short with leverage. Perps can be shorted and leveraged, and have funding and liquidation.
+Two kinds of market: 8 spot pairs (BTC/USD and others) and the matching 8 perpetual futures (BTC-PERP and others, priced from Kraken Futures). Spot pairs can also be traded on margin, as on Kraken, to go long or short with leverage. BTC and ETH have options, priced by this server. Perps can be shorted and leveraged, and have funding and liquidation.
 
 The backend is Rust (axum + tokio + SQLite); the frontend is a static page with no build step. The whole thing is one binary plus a `web/` directory.
 
@@ -90,6 +90,22 @@ Like Kraken's margin trading: a spot order with `leverage` (2x and up) opens a p
 | Liquidation | At Kraken's margin stop (40%) every margin position is closed at market against the real book, the user's USD-reserving orders are cancelled first, and the 0.5% liquidation fee goes to the insurance fund, which also covers any loss beyond the USD |
 | Closing | The Close tab or `POST /api/margin/close` sends a reduce-only market order |
 
+## Options
+
+Kraken has no options, so this server prices them itself: European BTC and ETH options, cash-settled in USD. For now students can buy calls and puts and sell back what they hold; writing options is not supported.
+
+| Topic | Rule |
+|---|---|
+| Contracts | Deribit-style symbols such as `BTC-30OCT26-80000-C`; one contract is one coin (BTC in steps of 0.01, ETH 0.1) |
+| Expiries | 08:00 UTC: the next 3 days, the next 4 Fridays, the last Friday of the next 3 months. Strikes every $1,000 (BTC) or $50 (ETH), 10 either side of the spot price |
+| Price | Black-Scholes with no interest rate, on the Kraken spot mid, at the volatility of Kraken's hourly closes over the last 30 days (refreshed hourly) |
+| Quotes | Our market maker buys at theo × (1 − `OPT_SPREAD`) and sells at theo × (1 + `OPT_SPREAD`), 3% by default, with a half-spread of at least 0.01% of spot. Market orders fill at once for the whole size (at most 25 BTC / 250 ETH contracts per order); a resting limit order fills at its price when the quote reaches it |
+| Fees | As on Deribit: 0.03% of the underlying per contract, at most 12.5% of the premium |
+| Settlement | At expiry, in cash, at the average Kraken spot mid over the last 30 minutes; open orders on the expired series are cancelled |
+| Accounting | An option held is a spot balance named after the contract, so it shows in Balances with its average cost and counts toward equity at its theoretical price |
+
+`OPTIONS=0` turns options off. A new season cashes options in at their theoretical price.
+
 ## Perpetual futures
 
 Perps are simulated against Kraken Futures' real perpetual books and trades (`PF_XBTUSD` and others, WebSocket v1). Matching works as for spot; a fill opens, grows, reduces or flips a position instead of delivering coins.
@@ -124,7 +140,7 @@ The admin can end a season: the standings are archived, all orders cancelled, an
 
 ## API (for students writing bots)
 
-Create an API key on the Account page and send `Authorization: Bearer <key>` with every request. Margin orders are spot orders with `"leverage": 2` (or more) and optionally `reduce_only`; the margin account, one-click close and position history are under `/api/margin*`. Perp orders use the same `POST /api/orders` with `symbol` set to e.g. `BTC-PERP` and optionally `reduce_only`; the futures wallet, transfers, leverage settings, margin top-ups, one-click close, position history and funding history are under `/api/futures/*`. Order fields follow Kraken's names (`limit_price`, `trigger_price`, `time_in_force`, `post_only`); authentication is simplified to a bearer token. A full example is under Account → API quick start.
+Create an API key on the Account page and send `Authorization: Bearer <key>` with every request. Option orders use `POST /api/orders` with an option symbol (market or limit; buy, or sell what you hold). Margin orders are spot orders with `"leverage": 2` (or more) and optionally `reduce_only`; the margin account, one-click close and position history are under `/api/margin*`. Perp orders use the same `POST /api/orders` with `symbol` set to e.g. `BTC-PERP` and optionally `reduce_only`; the futures wallet, transfers, leverage settings, margin top-ups, one-click close, position history and funding history are under `/api/futures/*`. Order fields follow Kraken's names (`limit_price`, `trigger_price`, `time_in_force`, `post_only`); authentication is simplified to a bearer token. A full example is under Account → API quick start.
 
 | Endpoint | Purpose |
 |---|---|
@@ -133,6 +149,7 @@ Create an API key on the Account page and send `Authorization: Bearer <key>` wit
 | `DELETE /api/orders/{id}`, `DELETE /api/orders` | Cancel one, cancel all |
 | `GET /api/portfolio`, `/api/fills` | Balances, fills |
 | `GET /api/margin`, `POST /api/margin/close`, `GET /api/margin/positions` | Spot margin: positions, margin level and Kraken's rules; close; history |
+| `GET /api/options/chain?underlying=BTC&expiry=`, `/api/options/quote?symbol=` | Options: one expiry's strikes with our bid and ask; one contract |
 | `GET /api/book`, `/api/trades`, `/api/candles`, `/api/tickers`, `/api/instruments` | Market data |
 | `WS /ws` | Send `{"op":"auth","token":…}`, then `{"op":"subscribe","symbol":…}` |
 
@@ -143,12 +160,12 @@ Order types: `market`, `limit`, `stop-loss`, `take-profit`, `stop-loss-limit`, `
 ## Development
 
 ```bash
-cargo test          # matching, ledger, spot margin, futures, Kraken message parsing and checksums
+cargo test          # matching, ledger, spot margin, options, futures, Kraken message parsing and checksums
 FEED=sim ADMIN_PASSWORD=adminpass123 INVITE_CODE=test cargo run
 ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # end-to-end checks against a running server
 ```
 
-`smoke_test.py` uses only the Python standard library and runs 37 checks in about 5 seconds: market data, WebSocket, every order type and its reservations, a 2x margin short, futures (transfers, leverage, isolated long, adding margin, changing leverage with a position, cross short, reduce-only, closing), account isolation, permissions, one-time invite codes, API keys and the ledger audit. It only needs `ADMIN_PASSWORD`. It uses dedicated accounts `smoke-a` / `smoke-b` / `smoke-c` (registered on the first run with one-time codes it creates), sells back what it bought and disables those accounts at the end, so they never appear on the leaderboard. `deploy.sh` runs it on the server after every deploy (`SMOKE=0 ./deploy.sh` skips it).
+`smoke_test.py` uses only the Python standard library and runs 38 checks in about 5 seconds: market data, WebSocket, every order type and its reservations, a 2x margin short, buying and selling an option, futures (transfers, leverage, isolated long, adding margin, changing leverage with a position, cross short, reduce-only, closing), account isolation, permissions, one-time invite codes, API keys and the ledger audit. It only needs `ADMIN_PASSWORD`. It uses dedicated accounts `smoke-a` / `smoke-b` / `smoke-c` (registered on the first run with one-time codes it creates), sells back what it bought and disables those accounts at the end, so they never appear on the leaderboard. `deploy.sh` runs it on the server after every deploy (`SMOKE=0 ./deploy.sh` skips it).
 
 | File | Contents |
 |---|---|
@@ -157,6 +174,7 @@ ADMIN_PASSWORD=adminpass123 python3 smoke_test.py   # end-to-end checks against 
 | `src/feed.rs` | Kraken spot feed and the simulated feed (including perps) |
 | `src/kfeed.rs` | Kraken Futures feed, contract rules, perp candles |
 | `src/margin.rs` | Spot margin: positions, held-back USD, rollover, liquidation |
+| `src/options.rs` | Options: calendar, Black-Scholes quotes, orders, settlement |
 | `src/futures.rs` | Futures: wallet, positions, margin, funding, liquidation |
 | `src/api.rs` | REST and WebSocket API |
 | `src/accounts.rs` | Users, sessions, API keys, one-time invite codes |

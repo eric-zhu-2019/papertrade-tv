@@ -630,6 +630,42 @@ class Run:
 
         self.check("现货做空（2x 杠杆）：开仓、保证金冻结、平仓", short_and_close)
 
+    # ---- options (priced by the server)
+
+    def options(self):
+        unders = self.cfg.get("options") or []
+        if not unders:
+            return
+
+        def buy_and_sell():
+            u = unders[0]
+            c = self.a.get(f"/api/options/chain?underlying={u}")
+            if c["expiry_ms"] - time.time() * 1000 < 3_600_000:  # too close to expiry: use the next one
+                c = self.a.get(f"/api/options/chain?underlying={u}&expiry={c['expiries'][1]['expiry_ms']}")
+            spot = D(c["spot"])
+            row = min(c["rows"], key=lambda r: abs(D(r["strike"]) - spot))
+            sym, ask = row["call"]["symbol"], D(row["call"]["ask"])
+            expect(D(row["call"]["bid"]) < ask, f"{sym} 买价 {row['call']['bid']} 应低于卖价 {ask}")
+            # put-call parity holds for the theoretical prices (no interest rate)
+            parity = D(row["call"]["theo"]) - D(row["put"]["theo"]) - (spot - D(row["strike"]))
+            expect(abs(parity) < spot * Decimal("0.001"), f"看涨看跌平价偏差 {parity}")
+            qty = D(c["qty_step"])
+            o = self.place(self.a, symbol=sym, side="buy", type="market", qty=qty, note="smoke option")
+            o = self.settle(self.a, o["id"], until=("filled", "canceled", "rejected"))
+            expect(o["status"] == "filled", f"期权买单状态 {o['status']}：{o.get('reason')}")
+            held, _, _ = self.balance(self.a, sym)
+            expect(held == qty, f"持有 {held} 张，应为 {qty}")
+            status, d = self.a.call("POST", "/api/orders", {"symbol": sym, "side": "sell", "type": "market", "qty": fmt(qty * 2)})
+            expect(status == 400 and "hold" in (d.get("error") or ""), f"裸卖期权返回 {status} {d.get('error')}")
+            s = self.place(self.a, symbol=sym, side="sell", type="market", qty=qty)
+            s = self.settle(self.a, s["id"], until=("filled", "canceled", "rejected"))
+            expect(s["status"] == "filled", f"期权卖单状态 {s['status']}：{s.get('reason')}")
+            held, _, _ = self.balance(self.a, sym)
+            expect(held == 0, f"卖出后仍持有 {held} 张")
+            return f"{sym}：买 {fmt(qty)} 张 @ {fmt(D(o['avg_price']))}，卖 @ {fmt(D(s['avg_price']))}；波动率 {c['vol'] * 100:.1f}%"
+
+        self.check("期权：报价、买入、拒绝裸卖、卖出", buy_and_sell)
+
     # ---- perpetual futures
 
     def futures(self):
@@ -871,6 +907,11 @@ class Run:
             if self.a and self.b:
                 for c in (self.a, self.b):
                     c.delete("/api/orders")
+                    # options left over from an interrupted run
+                    for a in c.get("/api/portfolio")["assets"]:
+                        if re.match(r"^[A-Z]+-\d+[A-Z]{3}\d{2}-[\d.]+-[CP]$", a["asset"]) and D(a["available"]) > 0:
+                            c.call("POST", "/api/orders", {"symbol": a["asset"], "side": "sell", "type": "market", "qty": a["available"]})
+                            done.append(f"卖出剩余期权 {a['asset']}")
                     # spot margin positions left over from an interrupted run
                     m = c.get("/api/margin")
                     for p in m["positions"]:
@@ -953,6 +994,7 @@ def main():
         if run.market_data():
             run.trading()
             run.margin()
+            run.options()
             run.futures()
         run.accounts()
     finally:

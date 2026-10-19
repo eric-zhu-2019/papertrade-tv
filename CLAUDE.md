@@ -4,10 +4,10 @@
 
 ## 常用命令
 
-- `cargo test`：46 个单元测试（撮合、账本、一次性邀请码、杠杆现货做空/展期费/强平、合约的保证金/反手/资金费/强平/调杠杆/追加保证金、Kraken 现货与合约消息解析）
+- `cargo test`：50 个单元测试（撮合、账本、一次性邀请码、杠杆现货做空/展期费/强平、期权日历/定价/买卖/结算、合约的保证金/反手/资金费/强平/调杠杆/追加保证金、Kraken 现货与合约消息解析）
 - `FEED=sim ADMIN_PASSWORD=adminpass123 INVITE_CODE=test cargo run`：本地用随机模拟行情运行，http://127.0.0.1:8080
 - `./deploy.sh <ssh主机> [远程目录]`：部署到 `<ssh主机>` 的 `~/apps/papertrade`（也可用环境变量 `DEPLOY_HOST` 指定主机）。不会覆盖远程 `.env` 和数据库卷；部署完自动在服务器上跑冒烟测试（`SMOKE=0` 跳过）
-- `python3 smoke_test.py [URL] [--env-file .env]`：对运行中的实例做 37 项端到端检查（含杠杆现货和合约），只需要 `ADMIN_PASSWORD`。改了 API 或撮合后要同步更新它
+- `python3 smoke_test.py [URL] [--env-file .env]`：对运行中的实例做 38 项端到端检查（含杠杆现货、期权和合约），只需要 `ADMIN_PASSWORD`。改了 API 或撮合后要同步更新它
 
 ## 部署
 
@@ -21,3 +21,4 @@
 - 引擎是 `Arc<Mutex<Engine>>`，锁内不能 `await`。
 - 第二期永续合约（`src/futures.rs`、`src/kfeed.rs`）：Kraken Futures 真实行情，杠杆跟 Kraken 一致，逐仓和全仓，单独的合约钱包。合约成交走 `fut_apply_fill`，不碰现货余额；改动后跑 `cargo test` 和冒烟测试，并确认对账无差错（合约钱包、逐仓保证金、挂单冻结都在对账里）。
 - 杠杆现货（`src/margin.rs`）：现货单带 `leverage`（≥2）就开仓位而不交割币，规则取自 Kraken AssetPairs/Assets。只用现货 USD 作抵押，仓位的保证金和浮亏通过 `Engine::free()` 从可用 USD 里扣出（不单独记账）；杠杆单冻结的是 USD。成交走 `margin_apply_fill`，改动后同样要跑测试、冒烟测试并确认对账。
+- 期权（`src/options.rs`）：Kraken 没有期权、Deribit 在加拿大不能用，所以由本服务器用 Black-Scholes 定价（Kraken 现货 + Kraken 30 天历史波动率），点差模拟做市商。只能买入和卖出已持有的期权。持有的期权就是名字为合约代码的现货余额，复用现货账本和对账。

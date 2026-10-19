@@ -105,6 +105,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/futures/margin", post(fut_margin))
         .route("/api/futures/positions", get(fut_positions))
         .route("/api/futures/funding", get(fut_funding))
+        .route("/api/options/chain", get(opt_chain))
+        .route("/api/options/quote", get(opt_quote))
         .route("/api/margin", get(margin_account))
         .route("/api/margin/close", post(margin_close))
         .route("/api/margin/positions", get(margin_positions))
@@ -135,6 +137,7 @@ async fn config(State(st): State<AppState>) -> Json<Value> {
         "quote": st.cfg.quote,
         "symbols": st.cfg.symbols,
         "perps": st.cfg.perps,
+        "options": st.cfg.options,
         "fut_maker_fee": st.cfg.fut_maker_fee.to_string(),
         "fut_taker_fee": st.cfg.fut_taker_fee.to_string(),
         "liq_fee": st.cfg.liq_fee.to_string(),
@@ -512,6 +515,19 @@ async fn fut_close(State(st): State<AppState>, a: Auth, Json(b): Json<Value>) ->
         note: b["note"].as_str().map(|s| s.to_string()).or(Some("close position".into())),
     };
     submit(&st, a.0.id, req)
+}
+
+/// ?underlying=BTC&expiry=<ms>: one expiry's strikes with our bid / ask (the nearest expiry by default).
+async fn opt_chain(State(st): State<AppState>, _a: Auth, Query(q): Q) -> R {
+    let u = q.get("underlying").map(|s| s.to_uppercase()).unwrap_or_else(|| "BTC".into());
+    let expiry = q.get("expiry").and_then(|e| e.parse().ok());
+    Ok(Json(st.engine.lock().unwrap().opt_chain(&u, expiry, now_ms()).map_err(bad)?))
+}
+
+/// ?symbol=BTC-25OCT26-80000-C
+async fn opt_quote(State(st): State<AppState>, _a: Auth, Query(q): Q) -> R {
+    let s = q.get("symbol").map(|s| s.to_uppercase()).unwrap_or_default();
+    Ok(Json(st.engine.lock().unwrap().opt_info(&s, now_ms()).map_err(bad)?))
 }
 
 async fn margin_account(State(st): State<AppState>, a: Auth) -> R {

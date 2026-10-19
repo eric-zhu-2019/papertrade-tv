@@ -38,6 +38,13 @@ pub struct Config {
     pub sim_funding_secs: i64,
     /// Spot margin: seconds between rollover fees (Kraken: every 4 hours).
     pub margin_rollover_secs: i64,
+    /// Underlyings with options ("BTC", "ETH"); empty when OPTIONS=0.
+    pub options: Vec<String>,
+    /// Our market maker's quote: theo × (1 ± spread).
+    pub opt_spread: Decimal,
+    /// Option fee per contract as a fraction of the underlying, capped at a fraction of the premium.
+    pub opt_fee: Decimal,
+    pub opt_fee_cap: Decimal,
 }
 
 fn var(k: &str, default: &str) -> String {
@@ -66,6 +73,15 @@ impl Config {
             vec![]
         } else {
             symbols.iter().filter_map(|s| s.split_once('/')).map(|(b, _)| format!("{b}-PERP")).collect()
+        };
+        let options = if matches!(var("OPTIONS", "1").as_str(), "0" | "false" | "no") {
+            vec![]
+        } else {
+            ["BTC", "ETH"]
+                .iter()
+                .filter(|u| symbols.iter().any(|s| s == &format!("{u}/{quote}")))
+                .map(|u| u.to_string())
+                .collect()
         };
         Config {
             bind: var("BIND", "0.0.0.0:8080"),
@@ -99,6 +115,10 @@ impl Config {
             fut_default_leverage: dec("FUT_DEFAULT_LEVERAGE", "10"),
             sim_funding_secs: var("SIM_FUNDING_SECS", "3600").parse().expect("SIM_FUNDING_SECS"),
             margin_rollover_secs: var("MARGIN_ROLLOVER_SECS", "14400").parse().expect("MARGIN_ROLLOVER_SECS"),
+            options,
+            opt_spread: dec("OPT_SPREAD", "0.03"),
+            opt_fee: dec("OPT_FEE", "0.0003"),
+            opt_fee_cap: dec("OPT_FEE_CAP", "0.125"),
         }
     }
 

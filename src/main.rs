@@ -8,12 +8,14 @@ mod feed;
 mod futures;
 mod kfeed;
 mod margin;
+mod options;
 #[cfg(test)]
 mod tests;
 mod util;
 
 use crate::engine::{Engine, Event};
 use crate::util::now_ms;
+use rust_decimal::prelude::ToPrimitive;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -70,7 +72,44 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                engine.lock().unwrap().margin_tick(now_ms());
+                let mut e = engine.lock().unwrap();
+                e.margin_tick(now_ms());
+                e.opt_tick(now_ms());
+            }
+        });
+    }
+
+    // options: volatility from the last 30 days of hourly Kraken candles, refreshed every hour
+    if !cfg.options.is_empty() {
+        let (engine, cfg, http) = (engine.clone(), cfg.clone(), http.clone());
+        tokio::spawn(async move {
+            loop {
+                let mut all = true;
+                for u in &cfg.options {
+                    let sym = format!("{u}/{}", cfg.quote);
+                    let closes: Vec<f64> = if cfg.feed == "sim" {
+                        engine.lock().unwrap().candles.get(&sym, 60).iter().filter_map(|c| c.c.to_f64()).collect()
+                    } else {
+                        match feed::fetch_ohlc(&http, &sym, 60).await {
+                            Ok(c) => c.iter().filter_map(|c| c.c.to_f64()).collect(),
+                            Err(e) => {
+                                tracing::warn!("options: no candles for {sym} volatility: {e}");
+                                vec![]
+                            }
+                        }
+                    };
+                    let n = closes.len().min(720);
+                    match options::realised_vol(&closes[closes.len() - n..]) {
+                        Some(v) => {
+                            let v = v.clamp(0.1, 3.0);
+                            tracing::info!("options: {u} volatility {:.1}% from {n} hourly closes", v * 100.0);
+                            engine.lock().unwrap().opt_vols.insert(u.clone(), v);
+                        }
+                        None => all = false,
+                    }
+                }
+                // until every underlying has a measured volatility (the default stands in), retry soon
+                tokio::time::sleep(Duration::from_secs(if all { 3600 } else { 60 })).await;
             }
         });
     }

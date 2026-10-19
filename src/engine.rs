@@ -272,6 +272,12 @@ pub struct Engine {
     // spot margin (see margin.rs)
     pub mpos: HashMap<(i64, String), MPos>,
     pub margin_rules: HashMap<String, MarginRule>,
+    // options (see options.rs)
+    pub opt_vols: HashMap<String, f64>,
+    /// Recent spot mids per underlying, for the settlement average.
+    pub(crate) opt_samples: HashMap<String, VecDeque<(i64, Decimal)>>,
+    /// Settlement price per (underlying, expiry).
+    pub(crate) opt_settled: HashMap<(String, i64), Decimal>,
 }
 
 const SCHEMA: &str = "
@@ -336,6 +342,9 @@ CREATE TABLE IF NOT EXISTS margin_positions(
   opened_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, next_rollover_ms INTEGER NOT NULL,
   closed_ms INTEGER, close_reason TEXT);
 CREATE INDEX IF NOT EXISTS margin_positions_user ON margin_positions(user_id, season_id, id);
+CREATE TABLE IF NOT EXISTS option_settlements(
+  underlying TEXT NOT NULL, expiry_ms INTEGER NOT NULL, price TEXT NOT NULL, settled_ms INTEGER NOT NULL,
+  PRIMARY KEY(underlying, expiry_ms));
 ";
 
 fn sdec(s: String) -> Decimal {
@@ -407,6 +416,9 @@ impl Engine {
             liquidating: false,
             mpos: HashMap::new(),
             margin_rules: HashMap::new(),
+            opt_vols: HashMap::new(),
+            opt_samples: HashMap::new(),
+            opt_settled: HashMap::new(),
         };
         e.load();
         e
@@ -458,6 +470,7 @@ impl Engine {
         }
         self.fut_load();
         self.margin_load();
+        self.opt_load();
         // stats
         {
             let mut st =
@@ -614,7 +627,7 @@ impl Engine {
             }
             if *asset == self.cfg.quote {
                 eq += b.total;
-            } else if let Some(p) = self.mark(&format!("{asset}/{}", self.cfg.quote)) {
+            } else if let Some(p) = self.mark(&format!("{asset}/{}", self.cfg.quote)).or_else(|| self.opt_value(asset)) {
                 eq += b.total * p;
             }
         }
@@ -890,6 +903,15 @@ impl Engine {
     /// simulated network latency. Stop orders wait as `untriggered`.
     pub fn place_order(&mut self, uid: i64, req: OrderReq, now: i64) -> Result<Order, String> {
         let cfg = self.cfg.clone();
+        if self.is_option(&req.symbol) {
+            if !self.take_token(uid, now) {
+                return Err("rate limit exceeded; slow down".into());
+            }
+            if self.orders.values().filter(|o| o.user_id == uid).count() >= cfg.max_open_orders {
+                return Err(format!("too many open orders (max {})", cfg.max_open_orders));
+            }
+            return self.opt_place_order(uid, req, now);
+        }
         let inst = self.instruments.get(&req.symbol).cloned().ok_or("unknown symbol")?;
         if !self.tradable(&req.symbol, now) {
             return Err("market data is unavailable right now; trading is paused".into());
@@ -1071,6 +1093,9 @@ impl Engine {
 
     fn execute(&mut self, oid: i64, now: i64) {
         let Some(o) = self.orders.get(&oid).cloned() else { return };
+        if self.is_option(&o.symbol) {
+            return self.opt_execute(oid, now);
+        }
         if !self.tradable(&o.symbol, now) {
             self.finish(oid, Status::Rejected, Some("market data became unavailable before the order reached the book"), now);
             return;
@@ -1443,7 +1468,11 @@ impl Engine {
             if b.total.is_zero() && !is_quote {
                 continue;
             }
-            let price = if is_quote { Some(Decimal::ONE) } else { self.mark(&format!("{}/{}", k.1, self.cfg.quote)) };
+            let price = if is_quote {
+                Some(Decimal::ONE)
+            } else {
+                self.mark(&format!("{}/{}", k.1, self.cfg.quote)).or_else(|| self.opt_value(&k.1))
+            };
             let value = price.map(|p| b.total * p);
             equity += value.unwrap_or(Decimal::ZERO);
             let avg = basis.get(&k.1).filter(|e| e.0 > Decimal::ZERO).map(|e| e.1 / e.0);
@@ -1659,6 +1688,7 @@ impl Engine {
         }
         self.fut_season_reset(now);
         self.margin_season_reset(now);
+        self.opt_season_reset(now);
         // sweep all balances back to the treasury
         let keys: Vec<(i64, String)> = self.balances.keys().cloned().collect();
         for (uid, asset) in keys {
@@ -1749,7 +1779,8 @@ impl Engine {
                 .values()
                 .filter(|o| o.user_id == *uid)
                 .filter(|o| {
-                    let (base, quote) = o.symbol.split_once('/').unwrap_or(("", ""));
+                    // spot "BASE/QUOTE"; an option holds itself
+                    let (base, quote) = o.symbol.split_once('/').unwrap_or((o.symbol.as_str(), self.cfg.quote.as_str()));
                     (if o.side == Side::Buy || o.leverage.is_some() { quote } else { base }) == asset
                 })
                 .map(|o| o.locked)

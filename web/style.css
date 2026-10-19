@@ -61,7 +61,17 @@ footer { padding: 14px; text-align: center; }
 .chart-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
 .chart-head .seg { margin-left: auto; }
 .big { font-family: var(--mono); font-size: 18px; font-weight: 700; margin-left: 8px; }
-#chart { height: 400px; } .line-chart { height: 260px; }
+#chart { height: 400px; }
+body.opt-mode #chart, body.opt-mode #intervals, body.opt-mode .book-panel, body.opt-mode .tape-panel, body.opt-mode #qty-unit { display: none; }
+.opt-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+#opt-exp { flex-wrap: wrap; }
+#opt-table td, #opt-table th { text-align: right; padding: 4px 8px; font-family: var(--mono); font-size: 12px; }
+#opt-table th { font-family: inherit; }
+#opt-table td.k { text-align: center; font-weight: 700; background: var(--panel2); }
+#opt-table td.q { cursor: pointer; } #opt-table td.q:hover { outline: 1px solid var(--muted); }
+#opt-table td.itm { background: rgba(232, 179, 57, .07); }
+#opt-table td.sel { outline: 2px solid #e8b339; }
+#opt-table tr.atm td.k { color: #e8b339; } .line-chart { height: 260px; }
 .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin: -4px -12px 0; padding: 0 8px; flex-wrap: wrap; }
 .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); padding: 8px 10px; }
 .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }

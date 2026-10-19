@@ -34,12 +34,14 @@ const fmtTime = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:$
 const fmtDT = (ms) => { const d = new Date(ms); return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${fmtTime(ms)}`; };
 const base = (sym) => sym.split("/")[0].replace(/-PERP$/, "");
 const isPerp = (sym) => !!(S.cfg && S.cfg.perps.includes(sym));
+/// Option symbols follow Deribit: BTC-25OCT26-80000-C
+const isOpt = (sym) => /^[A-Z]+-\d{1,2}[A-Z]{3}\d{2}-[\d.]+-[CP]$/.test(sym || "");
 const signUsd = (x) => (x == null ? "–" : (+x > 0 ? "+" : "") + fmtUsd(x));
 const position = (sym) => isPerp(sym)
   ? (S.fut ? S.fut.positions.find((p) => p.symbol === sym) : null)
   : (S.margin ? S.margin.positions.find((p) => p.symbol === sym) : null);
 /// Spot margin order: the leverage picked in the form (1 = a plain cash order).
-const spotLev = () => (isPerp(S.symbol) ? 1 : +form.mlev.value || 1);
+const spotLev = () => (isPerp(S.symbol) || isOpt(S.symbol) ? 1 : +form.mlev.value || 1);
 const floorTo = (x, dp) => Math.floor(x * 10 ** dp + 1e-9) / 10 ** dp;
 
 async function api(path, opts = {}) {
@@ -132,7 +134,7 @@ async function startApp() {
   $("#nav-admin").classList.toggle("hidden", !S.me.is_admin);
   $("#season-pill").textContent = S.cfg.season.name;
   await loadInstruments();
-  if (!S.cfg.symbols.includes(S.symbol) && !isPerp(S.symbol)) S.symbol = S.cfg.symbols[0];
+  if (!S.cfg.symbols.includes(S.symbol) && !isPerp(S.symbol) && !(isOpt(S.symbol) && (S.cfg.options || []).includes(S.symbol.split("-")[0]))) S.symbol = S.cfg.symbols[0];
   $$(".perp-only").forEach((el) => el.classList.toggle("hidden", !S.cfg.perps.length));
   $("#intervals").innerHTML = S.cfg.intervals.map((i) => `<button data-iv="${i}" class="${i === S.interval ? "on" : ""}">${i < 60 ? i + "m" : i < 1440 ? i / 60 + "h" : "1D"}</button>`).join("");
   if (!S.chart) initChart();
@@ -191,6 +193,10 @@ function onMessage(m) {
     case "futures":
       refreshSoon();
       break;
+    case "option_expiry":
+      toast(`${t("opt_expired")}: ${m.symbol} × ${fmtQty(m.qty)} @ ${fmtUsd(m.settlement)} → $${fmtUsd(m.payout)}`, +m.payout > 0 ? "good" : "");
+      refreshSoon();
+      break;
     case "margin":
       S.margin = m.account; updateForm();
       refreshSoon();
@@ -209,10 +215,19 @@ function onMessage(m) {
 
 // ---------------------------------------------------------------- markets, book, tape
 function renderMarkets() {
-  const perp = isPerp(S.symbol);
-  const seg = S.cfg.perps.length
-    ? `<div class="seg mkt-seg"><button data-mk="spot" class="${perp ? "" : "on"}">${esc(t("spot"))}</button><button data-mk="perp" class="${perp ? "on" : ""}">${esc(t("perps"))}</button></div>`
+  const perp = isPerp(S.symbol), opt = isOpt(S.symbol), kind = opt ? "opt" : perp ? "perp" : "spot";
+  const kinds = [["spot", "spot"], ...(S.cfg.perps.length ? [["perp", "perps"]] : []), ...((S.cfg.options || []).length ? [["opt", "options"]] : [])];
+  const seg = kinds.length > 1
+    ? `<div class="seg mkt-seg">${kinds.map(([k, l]) => `<button data-mk="${k}" class="${k === kind ? "on" : ""}">${esc(t(l))}</button>`).join("")}</div>`
     : "";
+  if (opt) {
+    const u = S.symbol.split("-")[0];
+    $("#markets").innerHTML = seg + S.cfg.options.map((x) => {
+      const tk = S.tickers[`${x}/${S.cfg.quote}`] || {};
+      return `<div class="mkt ${x === u ? "on" : ""}" data-under="${esc(x)}"><b>${esc(x)} ${esc(t("options"))}</b><span>${fmtPrice(`${x}/${S.cfg.quote}`, tk.last)}</span></div>`;
+    }).join("");
+    return;
+  }
   $("#markets").innerHTML = seg + (perp ? S.cfg.perps : S.cfg.symbols).map((s) => {
     const x = S.tickers[s] || {};
     const ch = x.change_pct == null ? null : +x.change_pct;
@@ -222,14 +237,20 @@ function renderMarkets() {
 $("#markets").addEventListener("click", (e) => {
   const mk = e.target.dataset.mk;
   if (mk) {
-    if ((mk === "perp") === isPerp(S.symbol)) return;
-    const last = store.get("pt_sym_" + mk), list = mk === "perp" ? S.cfg.perps : S.cfg.symbols;
+    const cur = isOpt(S.symbol) ? "opt" : isPerp(S.symbol) ? "perp" : "spot";
+    if (mk === cur) return;
+    const last = store.get("pt_sym_" + mk);
+    if (mk === "opt") return openOptions(last && isOpt(last) ? last : S.cfg.options[0]);
+    const list = mk === "perp" ? S.cfg.perps : S.cfg.symbols;
     return selectSymbol(list.includes(last) ? last : list[0]);
   }
-  const m = e.target.closest(".mkt"); if (m) selectSymbol(m.dataset.sym);
+  const m = e.target.closest(".mkt"); if (!m) return;
+  if (m.dataset.under) return openOptions(m.dataset.under);
+  selectSymbol(m.dataset.sym);
 });
 
 function renderSymHead() {
+  if (isOpt(S.symbol)) return renderOptHead();
   const x = S.tickers[S.symbol] || {};
   $("#sym-name").textContent = S.symbol;
   $("#sym-last").textContent = fmtPrice(S.symbol, x.last);
@@ -261,7 +282,20 @@ function renderBanner() {
 }
 
 function selectSymbol(sym) {
-  S.symbol = sym; store.set("pt_symbol", sym); store.set("pt_sym_" + (isPerp(sym) ? "perp" : "spot"), sym);
+  const opt = isOpt(sym);
+  S.symbol = sym; store.set("pt_symbol", sym); store.set("pt_sym_" + (opt ? "opt" : isPerp(sym) ? "perp" : "spot"), sym);
+  document.body.classList.toggle("opt-mode", opt);
+  $("#opt-chain").classList.toggle("hidden", !opt);
+  $("#opt-panel").classList.toggle("hidden", !opt);
+  if (opt) {
+    optInst(sym);
+    // the chain is priced off the underlying's spot book
+    const spot = `${sym.split("-")[0]}/${S.cfg.quote}`;
+    if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ op: "subscribe", symbol: spot }));
+    S.optQuote = null;
+    renderMarkets(); renderSymHead(); renderBanner(); updateForm(); renderOrderLines(); loadOptions();
+    return;
+  }
   S.book = { bids: [], asks: [] }; S.tape = [];
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ op: "subscribe", symbol: sym }));
   renderMarkets(); renderSymHead(); renderBanner(); renderBook(); renderTape(); updateForm(); loadCandles(); renderOrderLines();
@@ -295,6 +329,100 @@ function renderTape() {
   $("#tape").innerHTML = S.tape.slice(0, 40).map((x) => `<div class="tick"><span class="${x.side === "buy" ? "up" : "down"}">${fmtPrice(S.symbol, x.price)}</span><span>${num(x.qty, 0, 5)}</span><span class="muted">${fmtTime(x.ts)}</span></div>`).join("");
 }
 
+// ---------------------------------------------------------------- options
+// The server prices options (Black-Scholes on the Kraken spot, Kraken's 30-day volatility) and
+// quotes a bid and ask around that; the chain replaces the chart, the contract card the order book.
+/// Trading rules of an option contract, in the same shape as a spot instrument.
+function optInst(sym) {
+  if (S.inst[sym]) return S.inst[sym];
+  const step = sym.startsWith("BTC-") ? "0.01" : "0.1";
+  return (S.inst[sym] = { symbol: sym, kind: "option", base: sym, quote: S.cfg.quote, price_increment: "0.1", qty_increment: step, qty_min: step, price_precision: 1, qty_precision: step.length - 2 });
+}
+/// Open the options market on an underlying ("BTC") or a contract.
+function openOptions(x) {
+  if (isOpt(x)) return selectSymbol(x);
+  S.optUnder = x; S.optExpiry = null;
+  // pick the at-the-money call of the nearest expiry once the chain is in
+  api(`/options/chain?underlying=${encodeURIComponent(x)}`).then((c) => {
+    const atm = c.rows.reduce((a, r) => (Math.abs(+r.strike - +c.spot) < Math.abs(+a.strike - +c.spot) ? r : a), c.rows[0]);
+    S.optChain = c; selectSymbol(atm.call.symbol);
+  }).catch((ex) => toast(ex.message, "bad"));
+}
+async function loadOptions() {
+  const sym = S.symbol; if (!isOpt(sym)) return;
+  const [u, code] = sym.split("-");
+  try {
+    let c = S.optChain;
+    const want = S.optExpiry;
+    if (!c || c.underlying !== u || (want && c.expiry_ms !== want) || (!want && !c.expiries.some((e) => e.code === code && e.expiry_ms === c.expiry_ms))) {
+      const e = want || (c && c.underlying === u ? (c.expiries.find((x) => x.code === code) || {}).expiry_ms : null);
+      c = await api(`/options/chain?underlying=${u}` + (e ? `&expiry=${e}` : ""));
+    } else c = await api(`/options/chain?underlying=${u}&expiry=${c.expiry_ms}`);
+    if (sym !== S.symbol) return;
+    S.optChain = c; S.optExpiry = c.expiry_ms;
+    const q = await api(`/options/quote?symbol=${encodeURIComponent(sym)}`);
+    if (sym !== S.symbol) return;
+    S.optQuote = q;
+  } catch (ex) {
+    // an expired or unknown contract: back to the underlying's nearest expiry
+    if (/expired|unknown/.test(ex.message)) return openOptions(u);
+  }
+  renderChain(); renderOptPanel(); renderOptHead(); updateEstimate(); if (!document.activeElement || document.activeElement === document.body) updateForm();
+}
+setInterval(() => { if (S.me && S.view === "trade" && isOpt(S.symbol) && !document.hidden) loadOptions(); }, 2000);
+const fmtLeft = (ms) => {
+  const m = Math.max(0, Math.floor(ms / 60000)), dd = Math.floor(m / 1440), h = Math.floor(m / 60) % 24;
+  return dd ? `${dd}d ${h}h` : `${h}h ${pad(m % 60)}m`;
+};
+function renderChain() {
+  const c = S.optChain; if (!c) return;
+  $("#opt-exp").innerHTML = c.expiries.map((e) => `<button data-exp="${e.expiry_ms}" class="${e.expiry_ms === c.expiry_ms ? "on" : ""}">${esc(e.code)}</button>`).join("");
+  $("#opt-meta").textContent = `${t("underlying")} ${fmtUsd(c.spot)} · ${t("volatility")} ${(c.vol * 100).toFixed(1)}% · ${t("expires_in")} ${fmtLeft(c.expiry_ms - Date.now())}`;
+  const spot = +c.spot, step = c.rows.length > 1 ? +c.rows[1].strike - +c.rows[0].strike : 1;
+  const cell = (o, k, itm) => `<td class="q${itm ? " itm" : ""}${o.symbol === S.symbol ? " sel" : ""}" data-osym="${esc(o.symbol)}" data-oside="${k === "bid" ? "sell" : "buy"}">${o[k] == null ? "–" : num(o[k], 1, 1)}</td>`;
+  const head = `<tr><th>Δ</th><th>${esc(t("bid"))}</th><th>${esc(t("ask"))}</th><th class="k">${esc(t("strike"))}</th><th>${esc(t("bid"))}</th><th>${esc(t("ask"))}</th><th>Δ</th></tr>`;
+  const sub = `<tr><th colspan="3" class="up">${esc(t("calls"))}</th><th></th><th colspan="3" class="down">${esc(t("puts"))}</th></tr>`;
+  $("#opt-table").innerHTML = sub + head + c.rows.map((r) => {
+    const k = +r.strike, citm = k < spot, pitm = k > spot;
+    return `<tr class="${Math.abs(k - spot) < step / 2 ? "atm" : ""}"><td class="${citm ? "itm" : ""}">${r.call.delta ?? "–"}</td>${cell(r.call, "bid", citm)}${cell(r.call, "ask", citm)}<td class="k">${num(k, 0, 2)}</td>${cell(r.put, "bid", pitm)}${cell(r.put, "ask", pitm)}<td class="${pitm ? "itm" : ""}">${r.put.delta ?? "–"}</td></tr>`;
+  }).join("");
+}
+$("#opt-exp").addEventListener("click", (e) => {
+  const ex = +e.target.dataset.exp; if (!ex || !S.optChain) return;
+  S.optExpiry = ex;
+  api(`/options/chain?underlying=${S.optChain.underlying}&expiry=${ex}`).then((c) => {
+    S.optChain = c;
+    // keep the same strike and type on the new expiry when it is listed there
+    const [, , k, cp] = S.symbol.split("-");
+    const row = c.rows.find((r) => r.strike === k) || c.rows[Math.floor(c.rows.length / 2)];
+    selectSymbol(cp === "P" ? row.put.symbol : row.call.symbol);
+  }).catch((ex2) => toast(ex2.message, "bad"));
+});
+$("#opt-table").addEventListener("click", (e) => {
+  const td = e.target.closest("td[data-osym]"); if (!td) return;
+  S.side = td.dataset.oside;
+  if (td.dataset.osym !== S.symbol) selectSymbol(td.dataset.osym); else { updateForm(); renderChain(); }
+});
+function renderOptHead() {
+  const q = S.optQuote, sym = S.symbol;
+  $("#sym-name").textContent = sym;
+  $("#sym-last").textContent = q && q.theo != null ? num(q.theo, 1, 1) : "–";
+  $("#sym-chg").textContent = ""; $("#sym-chg").className = "";
+  $("#sym-stats").textContent = q ? `${t("theo_price")} · ${t(q.type)} ${num(q.strike, 0, 2)} · ${t("underlying")} ${fmtUsd(q.spot)}` : "";
+}
+function renderOptPanel() {
+  const q = S.optQuote; if (!q) { $("#opt-stats").innerHTML = ""; return; }
+  const k = +q.strike, ask = +q.ask, held = +((S.portfolio && S.portfolio.assets.find((a) => a.asset === q.symbol)) || { total: 0 }).total;
+  const be = q.type === "call" ? k + ask : k - ask;
+  $("#opt-stats").innerHTML = [
+    [t("theo_price"), num(q.theo, 1, 1)], [t("bid") + " / " + t("ask"), `<span class="up">${num(q.bid, 1, 1)}</span> / <span class="down">${num(q.ask, 1, 1)}</span>`],
+    [t("underlying"), fmtUsd(q.spot)], [t("strike"), num(k, 0, 2)],
+    ["Delta", q.delta == null ? "–" : (+q.delta).toFixed(3)], [t("volatility"), (q.vol * 100).toFixed(1) + "%"],
+    [t("expiry"), `${new Date(q.expiry_ms).toLocaleString()}`], [t("expires_in"), fmtLeft(q.expiry_ms - Date.now())],
+    [t("breakeven"), fmtUsd(be)], [t("held"), fmtQty(held)],
+  ].map(([a, b]) => `<div><span>${esc(a)}</span><b>${b}</b></div>`).join("");
+}
+
 // ---------------------------------------------------------------- chart
 const chartOpts = () => ({
   layout: { background: { color: "transparent" }, textColor: "#8492a3" },
@@ -311,6 +439,7 @@ function renderOrderLines() {
   if (!S.series) return;
   for (const l of S.orderLines || []) S.series.removePriceLine(l);
   S.orderLines = [];
+  if (isOpt(S.symbol)) return; // option premiums don't belong on the underlying's chart
   const stopName = { "stop-loss": "t_stop", "stop-loss-limit": "t_stop_limit", "take-profit": "t_tp", "take-profit-limit": "t_tp_limit" };
   for (const o of S.orders || []) {
     if (o.symbol !== S.symbol) continue;
@@ -338,6 +467,7 @@ function renderOrderLines() {
 }
 /// Where the selected order sits on the chart: its fill price once filled, else its limit or trigger.
 function selOrderPrice() {
+  if (isOpt(S.symbol)) return null;
   const o = S.selOrder;
   return o ? +(o.avg_price || o.limit_price || o.trigger_price || 0) || null : null;
 }
@@ -403,7 +533,7 @@ function initChart() {
 }
 async function loadCandles() {
   const sym = S.symbol, iv = S.interval, inst = S.inst[sym];
-  if (!inst || !S.series) return;
+  if (!inst || !S.series || isOpt(sym)) return;
   let r;
   try { r = await api(`/candles?symbol=${encodeURIComponent(sym)}&interval=${iv}`); } catch { return; }
   if (sym !== S.symbol || iv !== S.interval) return;
@@ -448,7 +578,11 @@ function futSettings(sym) {
   return S.fut && S.fut.settings[sym] ? S.fut.settings[sym] : { margin_mode: "isolated", leverage: "10", max_leverage: "10" };
 }
 function updateForm() {
-  const type = form.type.value, sym = S.symbol, perp = isPerp(sym);
+  const sym = S.symbol, perp = isPerp(sym), opt = isOpt(sym);
+  // options take market and limit orders only
+  for (const o of form.type.options) o.hidden = opt && !["market", "limit"].includes(o.value);
+  if (opt && !["market", "limit"].includes(form.type.value)) form.type.value = "limit";
+  const type = form.type.value;
   const hasLimit = type.includes("limit"), isStop = type !== "limit" && type !== "market";
   $("#row-price").classList.toggle("hidden", !hasLimit);
   $("#row-trigger").classList.toggle("hidden", !isStop);
@@ -461,7 +595,7 @@ function updateForm() {
   $("#fut-panel").classList.toggle("hidden", !perp);
   const btn = $("#submit-order");
   // spot: 1x is a cash order, 2x and up a margin order (Kraken's leverage for the pair)
-  const rule = !perp && S.margin && S.margin.rules[sym];
+  const rule = !perp && !opt && S.margin && S.margin.rules[sym];
   const maxLev = rule ? Math.max(+rule.max_long, +rule.max_short) : 1;
   const levs = ["1", ...Array.from({ length: Math.max(0, maxLev - 1) }, (_, i) => String(i + 2))];
   const optsKey = sym + levs.length + S.lang;
@@ -472,7 +606,7 @@ function updateForm() {
     form.mlev.dataset.k = optsKey;
   }
   $("#mlev-hint").textContent = maxLev > 1 ? t("margin_hint") : "";
-  const margin = !perp && +form.mlev.value > 1;
+  const margin = !perp && !opt && +form.mlev.value > 1;
   // perps and margin: an Open / Close tab. Open is Long / Short; Close is Close long / Close short and reduce-only
   const posMode = perp || margin;
   const closing = posMode && S.futAct === "close";
@@ -488,7 +622,7 @@ function updateForm() {
   const reduce = closing;
   btn.textContent = posMode
     ? `${t(reduce ? (S.side === "buy" ? "close_short" : "close_long") : S.side === "buy" ? "open_long" : "open_short")} ${base(sym)}`
-    : `${t(S.side)} ${base(sym)}`;
+    : opt ? `${t(S.side)} ${sym}` : `${t(S.side)} ${base(sym)}`;
   btn.className = "primary " + S.side;
   $$("#side-seg button").forEach((b) => b.classList.toggle("on", b.dataset.side === S.side));
   if (perp) {
@@ -505,6 +639,11 @@ function updateForm() {
       ? `${t("closable")}: ${pos ? fmtQty(pos.size) : 0} ${base(sym)}`
       : `${t("fut_avail")}: ${S.fut ? fmtUsd(S.fut.available) : "–"} ${S.cfg.quote}`;
     renderFutPanel();
+  } else if (opt) {
+    const asset = S.side === "buy" ? S.cfg.quote : sym;
+    $("#avail").textContent = S.side === "buy"
+      ? `${t("avail_lbl")}: ${num(assetAvail(asset), 0, 2)} ${asset}`
+      : `${t("held")}: ${fmtQty(assetAvail(sym))} ${t("contracts")}`;
   } else if (margin) {
     const pos = closablePos(), m = S.margin, lvl = m && m.margin_level != null ? +m.margin_level : null;
     const level = lvl == null ? "" : ` · ${t("margin_level")} ${lvl.toFixed(0)}%`;
@@ -527,13 +666,18 @@ function walkBook(qty) { // average price for a market order of this size on the
 }
 function refPrice() {
   const type = form.type.value;
+  if (isOpt(S.symbol)) {
+    if (type === "limit") return +form.limit_price.value || null;
+    const q = S.optQuote;
+    return q ? +(S.side === "buy" ? q.ask : q.bid) || null : null;
+  }
   if (type.includes("limit")) return +form.limit_price.value || null;
   if (type !== "market") return +form.trigger_price.value || null;
   const lv = S.side === "buy" ? S.book.asks : S.book.bids;
   return lv.length ? +lv[0][0] : null;
 }
 // ---- quantity in coins or in USD: a USD amount is turned into a coin quantity at the expected price
-const qtyInUsd = () => S.qtyUnit === "usd";
+const qtyInUsd = () => S.qtyUnit === "usd" && !isOpt(S.symbol);
 const qtyDp = () => Math.min((S.inst[S.symbol] || {}).qty_precision ?? 8, 8);
 /// Coins that `usd` buys (or sells) at the expected fill: walking the book for market orders, else the limit / trigger price.
 function usdToQty(usd) {
@@ -573,6 +717,14 @@ function updateEstimate() {
   const minQ = +((S.inst[S.symbol] || {}).qty_min || 0);
   if (qtyInUsd() && +form.qty.value > 0 && q != null && !(qty > 0 && qty >= minQ)) { el.textContent = `${t("qty_too_small")} (${fmtQty(minQ)} ${base(S.symbol)})`; return; }
   if (!(qty > 0)) { el.textContent = ""; return; }
+  if (isOpt(S.symbol)) {
+    const px = refPrice(), q = S.optQuote;
+    if (!px || !q) { el.textContent = ""; return; }
+    const cost = qty * px, fee = Math.min(+q.spot * +(S.optChain ? S.optChain.fee : 0.0003), px * +(S.optChain ? S.optChain.fee_cap : 0.125)) * qty;
+    const be = q.type === "call" ? +q.strike + px : +q.strike - px;
+    el.textContent = `${t("premium")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + (S.side === "buy" ? ` · ${t("breakeven")} ${fmtUsd(be)}` : "");
+    return;
+  }
   const px = type === "market" ? walkBook(qty) : refPrice();
   if (!px) { el.textContent = type === "market" ? "–" : ""; return; }
   const cost = qty * px;
@@ -648,6 +800,12 @@ $("#pcts").addEventListener("click", (e) => {
       q = (+S.fut.available * p) / (px * (1 / lev + +S.cfg.fut_taker_fee)) * 0.999;
     }
     return setPctQty(String(floorTo(q, dp)));
+  }
+  if (isOpt(S.symbol)) {
+    if (S.side === "sell") return setPctQty(String(floorTo(assetAvail(S.symbol) * p, dp)));
+    const px = refPrice(); if (!px) return;
+    const cap = +(S.optChain ? S.optChain.fee_cap : 0.125);
+    return setPctQty(String(floorTo(assetAvail(S.cfg.quote) * p / (px * (1 + cap)), dp)));
   }
   if (spotLev() > 1) {
     if (form.reduce_only.checked) { const c = closablePos(); if (c && p === 1) return setPctQty(c.size); q = c ? +c.size * p : 0; }
@@ -886,14 +1044,20 @@ const TABS = {
   positions: { load: async () => {
     const [f, m] = await Promise.all([S.cfg.perps.length ? api("/futures/account") : null, api("/margin")]);
     if (f) S.fut = f; S.margin = m;
-    return [...(f ? f.positions : []), ...m.positions.map((p) => ({ ...p, margin_mode: "margin", funding: String(-p.rollover) }))];
+    // options held: a long position at the average price paid, valued at the theoretical price
+    const opts = (S.portfolio ? S.portfolio.assets : []).filter((a) => isOpt(a.asset) && +a.total > 0).map((a) => ({
+      symbol: a.asset, side: "long", size: a.total, entry: a.avg_cost, mark: a.price, liq_price: null, margin: a.value,
+      margin_mode: "option", leverage: "1", unrealized_pnl: a.unrealized_pnl || "0",
+      roe_pct: a.avg_cost && +a.avg_cost > 0 ? String((+a.price / +a.avg_cost - 1) * 100) : "0", funding: "0",
+    }));
+    return [...(f ? f.positions : []), ...m.positions.map((p) => ({ ...p, margin_mode: "margin", funding: String(-p.rollover) })), ...opts];
   }, cols: () => [
     { h: t("market"), c: "name", f: (p) => `<a href="#" data-go="${esc(p.symbol)}">${esc(p.symbol)}</a>` },
     { h: t("side"), f: (p) => `<span class="${p.side === "long" ? "up" : "down"}">${esc(t(p.side))}</span>` },
     { h: t("size"), f: (p) => fmtQty(p.size) }, { h: t("entry_price"), f: (p) => fmtPrice(p.symbol, p.entry) },
     { h: t("mark_price"), f: (p) => fmtPrice(p.symbol, p.mark) },
     { h: t("liq_price"), f: (p) => (p.liq_price ? `<span class="down">${fmtPrice(p.symbol, p.liq_price)}</span>` : "–") },
-    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode === "margin" ? "spot_margin" : p.margin_mode))} ${esc(p.leverage)}x</span>` +
+    { h: t("margin"), f: (p) => `$${fmtUsd(p.margin)} <span class="muted">${esc(t(p.margin_mode === "margin" ? "spot_margin" : p.margin_mode === "option" ? "option_value" : p.margin_mode))}${p.margin_mode === "option" ? "" : " " + esc(p.leverage) + "x"}</span>` +
       (p.margin_mode === "isolated" ? `<button class="mini" data-addm="${esc(p.symbol)}" title="${esc(t("add_margin"))}">+</button><button class="mini" data-subm="${esc(p.symbol)}" title="${esc(t("remove_margin"))}">−</button>` : "") },
     { h: t("pnl"), f: (p) => `<span class="${cls(+p.unrealized_pnl)}">${signUsd(p.unrealized_pnl)} (${pct(+p.roe_pct)})</span>` },
     { h: t("funding_rollover"), f: (p) => `<span class="${cls(+p.funding)}">${signUsd(p.funding)}</span>` },
@@ -932,7 +1096,8 @@ async function loadTab() {
   try { const rows = await TABS[tab].load(); if (tab === S.tab) { tabRows = rows; renderTab(); } } catch {}
   if (tab === "open") setOrders(tabRows);
   else api("/orders").then((r) => { setOrders(r.orders); $("#open-count").textContent = r.orders.length || ""; }).catch(() => {});
-  const npos = (S.fut ? S.fut.positions.length : 0) + (S.margin ? S.margin.positions.length : 0);
+  const nopt = S.portfolio ? S.portfolio.assets.filter((a) => isOpt(a.asset) && +a.total > 0).length : 0;
+  const npos = (S.fut ? S.fut.positions.length : 0) + (S.margin ? S.margin.positions.length : 0) + nopt;
   $("#pos-count").textContent = npos || "";
 }
 function renderTab() {
@@ -967,7 +1132,12 @@ $("#tab-table").addEventListener("click", async (e) => {
     // closing at market is not undoable: ask for a second click
     if (closeArmed !== sym) { closeArmed = sym; e.target.textContent = t("confirm_close"); setTimeout(() => { if (closeArmed === sym) { closeArmed = null; renderTab(); } }, 3000); return; }
     closeArmed = null;
-    try { const r = await api(isPerp(sym) ? "/futures/close" : "/margin/close", { method: "POST", body: { symbol: sym } }); toast(`${t("order_sent")} #${r.order.id}`); } catch (ex) { toast(ex.message, "bad"); }
+    try {
+      const r = isOpt(sym)
+        ? await api("/orders", { method: "POST", body: { symbol: sym, side: "sell", type: "market", qty: String(assetAvail(sym)), note: "close position" } })
+        : await api(isPerp(sym) ? "/futures/close" : "/margin/close", { method: "POST", body: { symbol: sym } });
+      toast(`${t("order_sent")} #${r.order.id}`);
+    } catch (ex) { toast(ex.message, "bad"); }
     return refreshSoon();
   }
   const id = e.target.dataset.cancel; if (!id) return;
@@ -1084,6 +1254,12 @@ POST /api/orders            {"symbol":"BTC/USD","side":"sell","type":"market","q
 GET  /api/margin            positions, margin level, Kraken's leverage limits and fee rates
 POST /api/margin/close      {"symbol":"BTC/USD"}   market-close the whole position
 GET  /api/margin/positions  closed positions
+
+# Options on BTC and ETH, priced by this server (Black-Scholes, Kraken spot and 30-day volatility)
+GET  /api/options/chain?underlying=BTC[&expiry=<ms>]   strikes with our bid / ask, delta
+GET  /api/options/quote?symbol=BTC-30OCT26-80000-C      one contract
+POST /api/orders            {"symbol":"BTC-30OCT26-80000-C","side":"buy","type":"market","qty":"0.1"}
+                            sell only what you hold; cash-settled at expiry (08:00 UTC)
 
 # Perpetual futures (symbols like BTC-PERP; a separate USD wallet; 1 contract = 1 coin)
 POST /api/futures/transfer  {"amount":"1000","to":"futures"|"spot"}

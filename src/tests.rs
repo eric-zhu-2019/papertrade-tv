@@ -44,6 +44,10 @@ fn cfg() -> Config {
         fut_default_leverage: d("10"),
         sim_funding_secs: 3600,
         margin_rollover_secs: 14400,
+        options: vec!["BTC".into()],
+        opt_spread: d("0.03"),
+        opt_fee: d("0.0003"),
+        opt_fee_cap: d("0.125"),
     }
 }
 
@@ -1094,4 +1098,91 @@ fn kraken_margin_rules_are_parsed() {
     let (mut e2, u) = setup();
     crate::feed::apply_margin_rules(&mut e2, &pairs, &assets);
     assert!(e2.place_order(u, mreq(Side::Sell, OType::Market, "1", None, 4), T0).unwrap_err().contains("at most 3x"));
+}
+
+// ------------------------------------------------------------------ options
+
+use crate::options::{black_scholes, date_code, listed_expiries, OptSpec};
+
+#[test]
+fn option_calendar_and_symbols() {
+    // T0 is Friday 2027-01-15 08:00 UTC, an expiry itself, so it is no longer listed
+    let codes: Vec<String> = listed_expiries(T0).into_iter().map(date_code).collect();
+    assert_eq!(codes, ["16JAN27", "17JAN27", "18JAN27", "22JAN27", "29JAN27", "5FEB27", "12FEB27", "26FEB27", "26MAR27"]);
+    let s = OptSpec::parse("BTC-29JAN27-80000-C").unwrap();
+    assert_eq!((s.strike, s.call, s.expiry_ms), (d("80000"), true, T0 + 14 * 86_400_000));
+    assert_eq!(s.symbol(), "BTC-29JAN27-80000-C");
+    assert!(OptSpec::parse("BTC-30FEB27-80000-C").is_none());
+    assert!(OptSpec::parse("BTC-29JAN27-80000-X").is_none());
+}
+
+#[test]
+fn black_scholes_values() {
+    let (c, delta) = black_scholes(true, 100.0, 100.0, 1.0, 0.5);
+    assert!((c - 19.7413).abs() < 1e-3, "{c}");
+    assert!((delta - 0.5987).abs() < 1e-3, "{delta}");
+    let (p, _) = black_scholes(false, 100.0, 100.0, 1.0, 0.5);
+    assert!((c - p).abs() < 1e-9); // put-call parity at the money with no rates
+    assert_eq!(black_scholes(false, 90.0, 100.0, 0.0, 0.5).0, 10.0);
+}
+
+#[test]
+fn options_buy_sell_rest_and_settle_in_cash() {
+    let (mut e, u) = setup();
+    e.opt_vols.insert("BTC".into(), 0.5);
+    let expiry = listed_expiries(T0)[0];
+    let put = OptSpec { underlying: "BTC".into(), expiry_ms: expiry, strike: d("1000"), call: false }.symbol();
+    let oreq = |side, otype, qty: &str, limit: Option<&str>| OrderReq { symbol: put.clone(), ..req(side, otype, qty, limit) };
+
+    // buy 1 deep in-the-money put at our ask: theo (~900.05) + 3%, plus the fee (0.03% of spot)
+    let usd0 = bal(&e, u, "USD").0;
+    let id = go(&mut e, u, oreq(Side::Buy, OType::Market, "1", None));
+    let o = order(&e, u, id);
+    assert_eq!(o["status"], "filled");
+    let paid = d(o["avg_price"].as_str().unwrap());
+    assert!(paid > d("925") && paid < d("929"), "ask {paid}");
+    assert_eq!(bal(&e, u, &put).0, d("1"));
+    assert_eq!(bal(&e, u, "USD").0, usd0 - paid - round8(d("99.95") * d("0.0003")));
+    audit(&e);
+
+    // can't write options: only what is held can be sold
+    assert!(e.place_order(u, oreq(Side::Sell, OType::Market, "2", None), T0).unwrap_err().contains("only sell options you hold"));
+    go(&mut e, u, oreq(Side::Sell, OType::Market, "0.5", None));
+    assert_eq!(bal(&e, u, &put).0, d("0.5"));
+    // a buy below the ask rests and reserves USD until cancelled
+    let id = go(&mut e, u, oreq(Side::Buy, OType::Limit, "1", Some("800")));
+    assert_eq!(order(&e, u, id)["status"], "open");
+    assert_eq!(bal(&e, u, "USD").1, d("900"));
+    e.opt_tick(T0);
+    assert_eq!(order(&e, u, id)["status"], "open");
+    e.cancel_order(u, id, T0).unwrap();
+    assert_eq!(bal(&e, u, "USD").1, Decimal::ZERO);
+    audit(&e);
+
+    // expiry: cash at the average spot of the last 30 minutes
+    let usd1 = bal(&e, u, "USD").0;
+    e.feed_up(expiry - 600_000);
+    e.opt_tick(expiry - 600_000);
+    e.feed_up(expiry + 1000);
+    e.opt_tick(expiry + 1000);
+    assert_eq!(bal(&e, u, &put).0, Decimal::ZERO);
+    assert_eq!(bal(&e, u, "USD").0, usd1 + d("0.5") * (d("1000") - d("99.95")));
+    assert!(e.place_order(u, oreq(Side::Buy, OType::Market, "1", None), expiry + 2000).unwrap_err().contains("expired"));
+    audit(&e);
+}
+
+#[test]
+fn options_are_valued_in_equity_and_cashed_in_at_a_new_season() {
+    let (mut e, u) = setup();
+    e.opt_vols.insert("BTC".into(), 0.5);
+    let expiry = listed_expiries(T0)[3];
+    let put = OptSpec { underlying: "BTC".into(), expiry_ms: expiry, strike: d("1000"), call: false }.symbol();
+    go(&mut e, u, OrderReq { symbol: put.clone(), ..req(Side::Buy, OType::Market, "2", None) });
+    let theo = e.opt_value(&put).unwrap();
+    let eq = e.equity(u);
+    assert_eq!(eq, bal(&e, u, "USD").0 + d("2") * theo);
+    e.new_season("S2", T0);
+    assert_eq!(bal(&e, u, &put).0, Decimal::ZERO);
+    assert_eq!(bal(&e, u, "USD").0, d("100000"));
+    audit(&e);
 }
