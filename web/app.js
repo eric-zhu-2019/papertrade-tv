@@ -190,6 +190,9 @@ function onMessage(m) {
     case "order": {
       const o = m.order;
       if (o.status === "rejected" || (o.status === "canceled" && o.reason && !/by user/.test(o.reason))) toast(`#${o.id} ${t("s_" + o.status)}: ${o.reason}`, "bad");
+      // keep the chart's order lines current without waiting for the next refresh
+      const live = ["pending", "open", "untriggered"].includes(o.status);
+      setOrders([...(S.orders || []).filter((x) => x.id !== o.id), ...(live ? [o] : [])]);
       refreshSoon();
       break;
     }
@@ -253,7 +256,7 @@ function selectSymbol(sym) {
   S.symbol = sym; store.set("pt_symbol", sym); store.set("pt_sym_" + (isPerp(sym) ? "perp" : "spot"), sym);
   S.book = { bids: [], asks: [] }; S.tape = [];
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ op: "subscribe", symbol: sym }));
-  renderMarkets(); renderSymHead(); renderBanner(); renderBook(); renderTape(); updateForm(); loadCandles();
+  renderMarkets(); renderSymHead(); renderBanner(); renderBook(); renderTape(); updateForm(); loadCandles(); renderOrderLines();
 }
 
 let bookQueued = false;
@@ -291,9 +294,52 @@ const chartOpts = () => ({
   timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2a323d" },
   rightPriceScale: { borderColor: "#2a323d" }, crosshair: { mode: 0 }, autoSize: true,
 });
+/// The user's open orders; the chart draws a line for each one on the shown market.
+function setOrders(list) {
+  S.orders = list;
+  renderOrderLines();
+}
+function renderOrderLines() {
+  if (!S.series) return;
+  for (const l of S.orderLines || []) S.series.removePriceLine(l);
+  S.orderLines = [];
+  const stopName = { "stop-loss": "t_stop", "stop-loss-limit": "t_stop_limit", "take-profit": "t_tp", "take-profit-limit": "t_tp_limit" };
+  for (const o of S.orders || []) {
+    if (o.symbol !== S.symbol) continue;
+    const color = o.side === "buy" ? "#2fbf8f" : "#f0616d";
+    const left = fmtQty(+o.qty - +o.filled);
+    const add = (price, dashed, label) => S.orderLines.push(S.series.createPriceLine({
+      price: +price, color, lineWidth: 1, lineStyle: dashed ? 2 : 0, axisLabelVisible: true, title: label,
+    }));
+    if (o.trigger_price && o.status === "untriggered") {
+      // a stop waits at its trigger; a stop-limit also shows where it will rest once triggered
+      add(o.trigger_price, true, `${t(stopName[o.type] || "trigger")} ${t(o.side)} ${left}`);
+      if (o.limit_price) add(o.limit_price, true, `${t("limit_price")} ${t(o.side)} ${left}`);
+    } else if (o.limit_price) {
+      add(o.limit_price, false, `${t(o.side)} ${left}`);
+    }
+  }
+}
+
 function initChart() {
   S.chart = LightweightCharts.createChart($("#chart"), chartOpts());
-  S.series = S.chart.addCandlestickSeries({ upColor: "#2fbf8f", downColor: "#f0616d", borderVisible: false, wickUpColor: "#2fbf8f", wickDownColor: "#f0616d" });
+  S.series = S.chart.addCandlestickSeries({
+    upColor: "#2fbf8f", downColor: "#f0616d", borderVisible: false, wickUpColor: "#2fbf8f", wickDownColor: "#f0616d",
+    // stretch the price scale so every open order's line stays in view
+    autoscaleInfoProvider: (base) => {
+      const r = base();
+      if (!r || !r.priceRange) return r;
+      for (const o of S.orders || []) {
+        if (o.symbol !== S.symbol) continue;
+        for (const p of [o.limit_price, o.trigger_price]) {
+          if (!p) continue;
+          r.priceRange.minValue = Math.min(r.priceRange.minValue, +p);
+          r.priceRange.maxValue = Math.max(r.priceRange.maxValue, +p);
+        }
+      }
+      return r;
+    },
+  });
 }
 async function loadCandles() {
   const sym = S.symbol, iv = S.interval, inst = S.inst[sym];
@@ -677,8 +723,8 @@ let tabRows = [];
 async function loadTab() {
   const tab = S.tab;
   try { const rows = await TABS[tab].load(); if (tab === S.tab) { tabRows = rows; renderTab(); } } catch {}
-  if (tab === "open") S.orders = tabRows;
-  else api("/orders").then((r) => { S.orders = r.orders; $("#open-count").textContent = r.orders.length || ""; }).catch(() => {});
+  if (tab === "open") setOrders(tabRows);
+  else api("/orders").then((r) => { setOrders(r.orders); $("#open-count").textContent = r.orders.length || ""; }).catch(() => {});
   $("#pos-count").textContent = S.fut && S.fut.positions.length ? S.fut.positions.length : "";
 }
 function renderTab() {
