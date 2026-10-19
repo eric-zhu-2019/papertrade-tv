@@ -13,7 +13,7 @@ const S = {
   me: null, cfg: null, inst: {}, tickers: {}, feedOk: true, futFeedOk: true, side: "buy", tab: "open", view: "trade",
   fut: null, // futures account: wallet, positions, settings
   book: { bids: [], asks: [] }, tape: [], candles: [], portfolio: null,
-  sort: { key: "return_pct", dir: -1 }, board: null, boardSel: null, authMode: "login",
+  sort: { key: "return_pct", dir: -1 }, board: null, boardSel: null, authMode: "login", qtyUnit: store.get("pt_qty_unit") === "usd" ? "usd" : "coin", qtyExact: null,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -445,7 +445,10 @@ function updateForm() {
   $("#row-price").classList.toggle("hidden", !hasLimit);
   $("#row-trigger").classList.toggle("hidden", !isStop);
   $("#row-tif").classList.toggle("hidden", type !== "limit");
-  $("#qty-unit").textContent = base(sym);
+  const [coinBtn, usdBtn] = $$("#qty-unit button");
+  coinBtn.textContent = base(sym); usdBtn.textContent = S.cfg.quote;
+  coinBtn.title = t("qty_coin"); usdBtn.title = t("qty_in_usd");
+  coinBtn.classList.toggle("on", !qtyInUsd()); usdBtn.classList.toggle("on", qtyInUsd());
   $("#row-margin").classList.toggle("hidden", !perp);
   $("#row-reduce").classList.toggle("hidden", !perp);
   $("#fut-panel").classList.toggle("hidden", !perp);
@@ -490,14 +493,51 @@ function refPrice() {
   const lv = S.side === "buy" ? S.book.asks : S.book.bids;
   return lv.length ? +lv[0][0] : null;
 }
+// ---- quantity in coins or in USD: a USD amount is turned into a coin quantity at the expected price
+const qtyInUsd = () => S.qtyUnit === "usd";
+const qtyDp = () => Math.min((S.inst[S.symbol] || {}).qty_precision ?? 8, 8);
+/// Coins that `usd` buys (or sells) at the expected fill: walking the book for market orders, else the limit / trigger price.
+function usdToQty(usd) {
+  if (!(usd > 0)) return 0;
+  if (form.type.value === "market") {
+    const lv = S.side === "buy" ? S.book.asks : S.book.bids;
+    let left = usd, q = 0;
+    for (const [p, sz] of lv) { const take = Math.min(left, +p * +sz); q += take / +p; left -= take; if (left <= 1e-9) break; }
+    if (left > 1e-9) return null; // deeper than the visible book
+    return floorTo(q, qtyDp());
+  }
+  const px = refPrice();
+  return px ? floorTo(usd / px, qtyDp()) : null;
+}
+/// The coin quantity the form will send, as a string (null when it can't be worked out yet).
+function orderQty() {
+  const v = form.qty.value.trim();
+  if (!qtyInUsd()) return v;
+  const x = S.qtyExact;
+  if (x && x.usd === v && x.symbol === S.symbol && x.side === S.side && x.type === form.type.value) return x.qty; // set by a % button: exact, dust included
+  const q = usdToQty(+v);
+  return q == null ? null : String(q);
+}
+$("#qty-unit").addEventListener("click", (e) => {
+  const u = e.target.dataset.u; if (!u || u === S.qtyUnit) return;
+  e.preventDefault();
+  // carry the current amount over into the other unit
+  const v = +form.qty.value, px = form.type.value === "market" ? (v > 0 && !qtyInUsd() ? walkBook(v) : refPrice()) : refPrice();
+  if (v > 0 && px) form.qty.value = u === "usd" ? String(floorTo(v * px, 2)) : String(orderQty() ?? "");
+  S.qtyExact = null;
+  S.qtyUnit = u; store.set("pt_qty_unit", u);
+  updateForm();
+});
 function updateEstimate() {
-  const qty = +form.qty.value, type = form.type.value, el = $("#est");
+  const q = orderQty(), qty = +q, type = form.type.value, el = $("#est");
+  const minQ = +((S.inst[S.symbol] || {}).qty_min || 0);
+  if (qtyInUsd() && +form.qty.value > 0 && q != null && !(qty > 0 && qty >= minQ)) { el.textContent = `${t("qty_too_small")} (${fmtQty(minQ)} ${base(S.symbol)})`; return; }
   if (!(qty > 0)) { el.textContent = ""; return; }
   const px = type === "market" ? walkBook(qty) : refPrice();
   if (!px) { el.textContent = type === "market" ? "–" : ""; return; }
   const cost = qty * px;
   const maker = type === "limit" && form.post_only.checked;
-  const slip = type === "market" ? ` · ${t("est_slip")} ${fmtPrice(S.symbol, px)}` : "";
+  const slip = (type === "market" ? ` · ${t("est_slip")} ${fmtPrice(S.symbol, px)}` : "") + (qtyInUsd() ? ` · ≈ ${fmtQty(q)} ${base(S.symbol)}` : "");
   if (isPerp(S.symbol)) {
     const fee = cost * +(maker ? S.cfg.fut_maker_fee : S.cfg.fut_taker_fee);
     const margin = form.reduce_only.checked ? 0 : cost / Math.max(1, +form.leverage.value || 1);
@@ -507,7 +547,7 @@ function updateEstimate() {
   const fee = cost * +(maker ? S.cfg.maker_fee : S.cfg.taker_fee);
   el.textContent = `${t("est_cost")} $${fmtUsd(cost)} · ${t("est_fee")} ≤ $${fmtUsd(fee)}` + slip;
 }
-form.addEventListener("input", updateForm);
+form.addEventListener("input", (e) => { if (e.target !== form.qty) S.qtyExact = null; updateForm(); });
 $("#side-seg").addEventListener("click", (e) => { if (e.target.dataset.side) { S.side = e.target.dataset.side; updateForm(); } });
 $("#pcts").addEventListener("click", (e) => {
   const p = +e.target.dataset.p; if (!p) return;
@@ -523,8 +563,7 @@ $("#pcts").addEventListener("click", (e) => {
       const lev = Math.max(1, +form.leverage.value || 1);
       q = (+S.fut.available * p) / (px * (1 / lev + +S.cfg.fut_taker_fee)) * 0.999;
     }
-    form.qty.value = String(floorTo(q, dp));
-    return updateEstimate();
+    return setPctQty(String(floorTo(q, dp)));
   }
   if (S.side === "sell") q = assetAvail(base(S.symbol)) * p;
   else {
@@ -533,22 +572,34 @@ $("#pcts").addEventListener("click", (e) => {
     q = assetAvail(S.cfg.quote) * p / (px * (1 + Math.max(+S.cfg.taker_fee, +S.cfg.maker_fee)) * 1.0001);
   }
   // selling 100% must sell the exact balance, dust included
-  form.qty.value = S.side === "sell" && p === 1 ? String(assetAvail(base(S.symbol))) : String(floorTo(q, dp));
-  updateEstimate();
+  setPctQty(S.side === "sell" && p === 1 ? String(assetAvail(base(S.symbol))) : String(floorTo(q, dp)));
 });
+/// Put a %-button quantity in the box, shown in USD when that is the unit (the exact coins are kept for the order).
+function setPctQty(q) {
+  S.qtyExact = null;
+  if (!qtyInUsd()) form.qty.value = q;
+  else {
+    const px = form.type.value === "market" ? walkBook(+q) || refPrice() : refPrice();
+    form.qty.value = px ? String(floorTo(+q * px, 2)) : "";
+    S.qtyExact = { usd: form.qty.value, qty: q, symbol: S.symbol, side: S.side, type: form.type.value };
+  }
+  updateEstimate();
+}
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(form));
-  const type = f.type, body = { symbol: S.symbol, side: S.side, type, qty: f.qty.trim(), note: f.note };
+  const err = $("#order-err"); err.textContent = "";
+  const qty = orderQty();
+  if (qtyInUsd() && !(+qty > 0)) { err.textContent = qty == null ? t("est_unavailable") : t("qty_too_small"); return; }
+  const type = f.type, body = { symbol: S.symbol, side: S.side, type, qty, note: f.note };
   if (type.includes("limit")) body.limit_price = f.limit_price.trim();
   if (type !== "limit" && type !== "market") body.trigger_price = f.trigger_price.trim();
   if (type === "limit") { body.time_in_force = f.time_in_force; body.post_only = !!f.post_only; }
   if (isPerp(S.symbol)) body.reduce_only = !!f.reduce_only;
-  const err = $("#order-err"); err.textContent = "";
   try {
     const r = await api("/orders", { method: "POST", body });
     toast(`${t("order_sent")} #${r.order.id}`);
-    form.qty.value = ""; form.note.value = "";
+    form.qty.value = ""; form.note.value = ""; S.qtyExact = null;
     updateEstimate(); refreshSoon();
   } catch (ex) { err.textContent = ex.message; }
 });
