@@ -64,7 +64,7 @@ function toast(msg, kind = "") {
 }
 
 function table(el, cols, rows, opts = {}) {
-  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${esc(t("nothing"))}</td></tr>`; return; }
+  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${opts.empty || esc(t("nothing"))}</td></tr>`; return; }
   const head = cols.map((c) => `<th class="${c.sort ? "sortable" : ""} ${opts.sorted === c.sort && c.sort ? "sorted" : ""}" data-sort="${c.sort || ""}">${esc(c.h)}</th>`).join("");
   const body = rows.map((r) => `<tr class="${opts.rowClass ? opts.rowClass(r) : ""}" data-id="${esc(opts.rowId ? opts.rowId(r) : "")}">${cols.map((c) => `<td class="${c.c || ""}">${c.f(r)}</td>`).join("")}</tr>`).join("");
   el.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
@@ -183,6 +183,8 @@ function onMessage(m) {
     case "fill": {
       const f = m.fill;
       toast(`${t("filled_toast")}: ${t(f.side)} ${fmtQty(f.qty)} ${base(f.symbol)} @ ${fmtPrice(f.symbol, f.price)}`, "good");
+      noteBuy(m.order); renderOrderLines();
+
       refreshSoon();
       break;
     }
@@ -206,6 +208,7 @@ function onMessage(m) {
       if (o.status === "rejected" || (o.status === "canceled" && o.reason && !/by user/.test(o.reason))) toast(`#${o.id} ${t("s_" + o.status)}: ${o.reason}`, "bad");
       // keep the chart's order lines current without waiting for the next refresh
       const live = ["pending", "open", "untriggered"].includes(o.status);
+      noteBuy(o);
       setOrders([...(S.orders || []).filter((x) => x.id !== o.id), ...(live ? [o] : [])]);
       refreshSoon();
       break;
@@ -298,7 +301,9 @@ function selectSymbol(sym) {
   }
   S.book = { bids: [], asks: [] }; S.tape = [];
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ op: "subscribe", symbol: sym }));
+  S.lastBuy = null;
   renderMarkets(); renderSymHead(); renderBanner(); renderBook(); renderTape(); updateForm(); loadCandles(); renderOrderLines();
+  loadLastBuy();
 }
 
 let bookQueued = false;
@@ -440,6 +445,11 @@ function renderOrderLines() {
   for (const l of S.orderLines || []) S.series.removePriceLine(l);
   S.orderLines = [];
   if (isOpt(S.symbol)) return; // option premiums don't belong on the underlying's chart
+  const lb = S.lastBuy && S.lastBuy.symbol === S.symbol ? S.lastBuy : null;
+  if (lb) S.orderLines.push(S.series.createPriceLine({
+    price: +lb.price, color: "#5b9cf6", lineWidth: 1, lineStyle: 1, axisLabelVisible: true,
+    title: `${t("last_buy")} ${fmtQty(lb.qty)} · ${fmtDT(lb.ts)}`,
+  }));
   const stopName = { "stop-loss": "t_stop", "stop-loss-limit": "t_stop_limit", "take-profit": "t_tp", "take-profit-limit": "t_tp_limit" };
   for (const o of S.orders || []) {
     if (o.symbol !== S.symbol) continue;
@@ -490,7 +500,8 @@ function clearSelOrder() {
 function focusSelOrder() {
   const o = S.selOrder, c = S.candles || [];
   if (!S.series) return false;
-  if (!o || o.symbol !== S.symbol || !c.length) { S.series.setMarkers([]); return false; }
+  S.selMarks = [];
+  if (!o || o.symbol !== S.symbol || !c.length) { renderMarkers(); return false; }
   const span = S.interval * 60, bar = (ms) => Math.floor(ms / 1000 / span) * span + TZ;
   // index of the candle holding a timestamp (clamped to the loaded range)
   const idx = (ms) => { const b = bar(ms), i = c.findIndex((k) => k.time >= b); return i < 0 ? c.length - 1 : i; };
@@ -499,11 +510,46 @@ function focusSelOrder() {
   const color = o.side === "buy" ? "#2fbf8f" : "#f0616d", below = o.side === "buy";
   const marks = [{ time: c[i0].time, position: below ? "belowBar" : "aboveBar", color: "#e8b339", shape: below ? "arrowUp" : "arrowDown", text: `#${o.id}` }];
   if (done && +o.filled > 0 && i1 !== i0) marks.push({ time: c[i1].time, position: below ? "belowBar" : "aboveBar", color, shape: "circle", text: t("s_" + o.status) });
-  S.series.setMarkers(marks);
+  S.selMarks = marks; renderMarkers();
   // centre the order's lifetime, but don't scroll past the newest candle
   const half = Math.max(70, (i1 - i0) / 2 + 20), to = Math.min((i0 + i1) / 2 + half, c.length + 4);
   S.chart.timeScale().setVisibleLogicalRange({ from: to - 2 * half, to });
   return true;
+}
+/// The candle (by time) holding a timestamp, or null when it is outside the loaded candles.
+function candleAt(ms) {
+  const c = S.candles || [], span = S.interval * 60, b = Math.floor(ms / 1000 / span) * span + TZ;
+  if (!c.length || b < c[0].time) return null;
+  const k = c.find((x) => x.time >= b);
+  return k ? k.time : c[c.length - 1].time;
+}
+/// Chart markers: the selected order's, plus where the latest buy on this market happened.
+function renderMarkers() {
+  if (!S.series) return;
+  const marks = [...(S.selMarks || [])];
+  const lb = S.lastBuy && S.lastBuy.symbol === S.symbol ? S.lastBuy : null;
+  const when = lb && candleAt(lb.ts);
+  if (when) marks.push({ time: when, position: "belowBar", color: "#5b9cf6", shape: "arrowUp", text: `${t("last_buy")} ${fmtQty(lb.qty)}` });
+  S.series.setMarkers(marks.sort((a, b) => a.time - b.time));
+}
+/// A finished buy order as the latest buy: its average price, the quantity filled and when it finished.
+const asLastBuy = (o) => ({ symbol: o.symbol, price: o.avg_price, qty: o.filled, ts: o.updated_ms });
+/// A buy order that just finished (filled, or cancelled after a partial fill) becomes the latest buy.
+function noteBuy(o) {
+  if (!o || ["pending", "open", "untriggered"].includes(o.status) || o.side !== "buy" || !(+o.filled > 0) || o.symbol !== S.symbol) return;
+  S.lastBuy = asLastBuy(o); renderMarkers();
+}
+/// The user's most recent buy order (filled at least in part) on the shown market.
+async function loadLastBuy() {
+  const sym = S.symbol;
+  if (isOpt(sym)) return;
+  try {
+    const r = await api(`/orders?status=closed&limit=200`);
+    if (sym !== S.symbol) return;
+    const o = r.orders.find((x) => x.symbol === sym && x.side === "buy" && +x.filled > 0);
+    S.lastBuy = o ? asLastBuy(o) : null;
+  } catch { return; }
+  renderOrderLines(); renderMarkers();
 }
 function showLatest() {
   const n = (S.candles || []).length;
@@ -519,6 +565,7 @@ function initChart() {
       const r = base();
       if (!r || !r.priceRange) return r;
       const sel = S.selOrder && S.selOrder.symbol === S.symbol ? [{ symbol: S.symbol, limit_price: selOrderPrice() }] : [];
+      if (S.lastBuy && S.lastBuy.symbol === S.symbol) sel.push({ symbol: S.symbol, limit_price: S.lastBuy.price });
       for (const o of [...(S.orders || []), ...sel]) {
         if (o.symbol !== S.symbol) continue;
         for (const p of [o.limit_price, o.trigger_price]) {
@@ -541,6 +588,7 @@ async function loadCandles() {
   S.candles = r.candles.map((c) => ({ time: c[0] + TZ, open: +c[1], high: +c[2], low: +c[3], close: +c[4] }));
   S.series.setData(S.candles);
   if (!focusSelOrder()) showLatest();
+  renderMarkers();
 }
 function chartTrade(tr) {
   const span = S.interval * 60, b = Math.floor(tr.ts / 1000 / span) * span + TZ, p = +tr.price;
@@ -1105,6 +1153,9 @@ function renderTab() {
   table($("#tab-table"), TABS[S.tab].cols(), tabRows, orderTab ? {
     rowId: (o) => o.id,
     rowClass: (o) => "clickable" + (S.selOrder && S.selOrder.id === o.id ? " sel" : ""),
+  } : S.tab === "positions" ? {
+    // coins bought on spot are holdings, not positions (as on Kraken / Binance): point to where they are
+    empty: `${esc(t("no_positions"))} <a href="#" data-gotab="balances">${esc(t("see_balances"))}</a>`,
   } : {});
   if (S.tab === "open") $("#open-count").textContent = tabRows.length || "";
   $("#cancel-all").classList.toggle("hidden", S.tab !== "open" || !tabRows.length);
@@ -1125,6 +1176,7 @@ $("#tab-table").addEventListener("click", async (e) => {
   }
   const go = e.target.dataset.go;
   if (go) { e.preventDefault(); return selectSymbol(go); }
+  if (e.target.dataset.gotab) { e.preventDefault(); return $(`#tabs [data-tab="${e.target.dataset.gotab}"]`).click(); }
   if (e.target.dataset.addm) return marginDialog(e.target.dataset.addm, true);
   if (e.target.dataset.subm) return marginDialog(e.target.dataset.subm, false);
   const sym = e.target.dataset.close;
