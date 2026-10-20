@@ -534,20 +534,24 @@ function renderMarkers() {
 }
 /// A finished buy order as the latest buy: its average price, the quantity filled and when it finished.
 const asLastBuy = (o) => ({ symbol: o.symbol, price: o.avg_price, qty: o.filled, ts: o.updated_ms });
-/// A buy order that just finished (filled, or cancelled after a partial fill) becomes the latest buy.
+/// An order that just finished (filled, or cancelled after a partial fill): a buy becomes the latest
+/// buy; a sell clears the mark, since the coins bought have been sold.
 function noteBuy(o) {
-  if (!o || ["pending", "open", "untriggered"].includes(o.status) || o.side !== "buy" || !(+o.filled > 0) || o.symbol !== S.symbol) return;
-  S.lastBuy = asLastBuy(o); renderMarkers();
+  if (!o || ["pending", "open", "untriggered"].includes(o.status) || !(+o.filled > 0) || o.symbol !== S.symbol) return;
+  S.lastBuy = o.side === "buy" ? asLastBuy(o) : null;
+  renderMarkers();
 }
-/// The user's most recent buy order (filled at least in part) on the shown market.
+/// The user's most recent buy order (filled at least in part) on the shown market, unless a sell
+/// has traded there since.
 async function loadLastBuy() {
   const sym = S.symbol;
   if (isOpt(sym)) return;
   try {
     const r = await api(`/orders?status=closed&limit=200`);
     if (sym !== S.symbol) return;
-    const o = r.orders.find((x) => x.symbol === sym && x.side === "buy" && +x.filled > 0);
-    S.lastBuy = o ? asLastBuy(o) : null;
+    // the latest order to trade on this market, by when it finished
+    const o = r.orders.filter((x) => x.symbol === sym && +x.filled > 0).sort((a, b) => b.updated_ms - a.updated_ms)[0];
+    S.lastBuy = o && o.side === "buy" ? asLastBuy(o) : null;
   } catch { return; }
   renderOrderLines(); renderMarkers();
 }
